@@ -27,7 +27,7 @@ from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.distributed.fsdp import MixedPrecision
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 import torch.nn.functional as F
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -135,11 +135,12 @@ class Packer:
 # ---------------------------
 
 def setup_dist():
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")  # ROCm uses RCCL under the hood
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl", device_id=device)  # ROCm uses RCCL under the hood
+    
     return local_rank, device
 
 
@@ -194,9 +195,9 @@ def train(args):
         tok.pad_token = tok.eos_token
 
     # Load model
-    # Choose dtype explicitly. To run pure FP32, set dtype=torch.float32 below.
-    # dtype = torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else torch.float32
-    dtype = torch.float32
+    # Choose dtype from flags (default FP32; enable BF16/FP16 only when flag is provided)
+    dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
+    print("passin dtype", dtype)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         dtype=dtype,
@@ -209,7 +210,7 @@ def train(args):
     mp_policy = None
 
     # FSDP config (optional)
-    use_fsdp = not getattr(args, "no_fsdp", False)
+    use_fsdp = dist.get_world_size() > 1
     if use_fsdp:
         wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=int(args.fsdp_wrap_min_params))
         # Set FSDP mixed precision to match chosen dtype
@@ -224,53 +225,24 @@ def train(args):
         model = model.to(device)
 
     # Attention implementation selectable
-    try:
-        model.config.attn_implementation = getattr(args, "attn_impl", "eager")
-    except Exception:
-        model.config.attn_implementation = "eager"
+    model.config.attn_implementation = getattr(args, "attn_impl")
+    
     torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_math_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    # print(torch.backends.cuda.flash_sdp_enabled())
+    # print(torch.backends.cuda.mem_efficient_sdp_enabled())
+    # print(torch.backends.cuda.math_sdp_enabled())
 
-    # Optional: autograd anomaly detection for debugging backward NaNs (slow)
-    if getattr(args, "debug_autograd", False):
-        torch.autograd.set_detect_anomaly(True)
 
     # Optional per-layer NaN/Inf forward detection (rank0 only)
     nan_hook_handles: List[Any] = []
-    if getattr(args, "debug_nan", False) and is_master:
-        def _iter_tensors(x):
-            if torch.is_tensor(x):
-                yield x
-            elif isinstance(x, (list, tuple)):
-                for y in x:
-                    yield from _iter_tensors(y)
-            elif isinstance(x, dict):
-                for y in x.values():
-                    yield from _iter_tensors(y)
-
-        def _make_hook(mod_name: str):
-            def _hook(_mod, _inp, _out):
-                try:
-                    for t in _iter_tensors(_out):
-                        if t is None:
-                            continue
-                        if not torch.isfinite(t).all():
-                            num_nonfinite = int((~torch.isfinite(t)).sum().item())
-                            print(json.dumps({"nan_forward": True, "module": mod_name, "num_nonfinite": num_nonfinite}))
-                            break
-                except Exception:
-                    pass
-            return _hook
-
-        for name, module in model.named_modules():
-            # Only hook leaf modules to reduce noise
-            if len(list(module.children())) == 0:
-                h = module.register_forward_hook(_make_hook(name))
-                nan_hook_handles.append(h)
+    
 
     # Optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     # AMP scaler only for FP16 training
-    scaler = GradScaler() if dtype == torch.float16 else None
+    scaler = GradScaler('cuda') if dtype == torch.float16 else None
 
     # Data
     ds = JsonlSFTDataset(args.train_json, input_key=args.input_key, target_key=args.target_key)
@@ -342,11 +314,12 @@ def train(args):
 
         autocast_dtype = torch.bfloat16 if dtype == torch.bfloat16 else (torch.float16 if dtype == torch.float16 else None)
         if autocast_dtype is not None:
-            with autocast(dtype=autocast_dtype):
+            with autocast(dtype=autocast_dtype, device_type='cuda'):
                 loss = compute_safe_ce_loss()
+                # loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
         else:
-            # loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
-            loss = compute_safe_ce_loss()
+            loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
+            # loss = compute_safe_ce_loss()
 
         loss = loss / args.grad_accum_steps
         # Guard against non-finite loss to avoid poisoning optimizer state
@@ -493,8 +466,9 @@ def parse_args():
     p.add_argument("--target_key", type=str, default="target")
     # training
     p.add_argument("--seq_len", type=int, default=1024)
-    p.add_argument("--bf16", action="store_false")
-    p.add_argument("--fp16", action="store_false")
+    prec = p.add_mutually_exclusive_group()
+    prec.add_argument("--bf16", action="store_true", help="Enable bfloat16 training")
+    prec.add_argument("--fp16", action="store_true", help="Enable float16 training")
     p.add_argument("--use_activation_checkpointing", action="store_true")
     p.add_argument("--pack_sequences", action="store_true")
     p.add_argument("--micro_batch_size", type=int, default=1)
@@ -505,11 +479,10 @@ def parse_args():
     p.add_argument("--max_steps", type=int, default=100)
     # fsdp
     p.add_argument("--fsdp_wrap_min_params", type=float, default=1e7, help="Auto-wrap modules above this param count")
-    p.add_argument("--no_fsdp", action="store_true", help="Disable FSDP and run single-device training")
     # debugging/toggles
     p.add_argument("--debug_autograd", action="store_true", help="Enable autograd anomaly detection (slow)")
     p.add_argument("--sanitize_grads", action="store_true", help="Replace NaN/Inf grads with 0 and clamp gradients")
-    p.add_argument("--attn_impl", type=str, default="eager", choices=["eager", "sdpa"], help="Attention implementation")
+    p.add_argument("--attn_impl", type=str, default="sdpa", choices=["eager", "sdpa"], help="Attention implementation")
     p.add_argument("--debug_nan", action="store_true", help="Enable per-layer forward NaN/Inf detection on rank0")
     # logging / io
     p.add_argument("--log_every", type=int, default=20)
