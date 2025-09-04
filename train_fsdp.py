@@ -182,6 +182,14 @@ def save_plain_full(model: torch.nn.Module, out_dir: str, step: int):
 # Main Training Loop
 # ---------------------------
 
+def nan_inf_hook(name):
+    def hook(module, input, output):
+        if not isinstance(output, torch.Tensor):
+            return
+        if torch.isnan(output).any() or torch.isinf(output).any():
+            print(f"NaN/Inf detected in {name}")
+    return hook
+
 def train(args):
     rank, device = setup_dist()
     is_master = rank == 0
@@ -214,11 +222,9 @@ def train(args):
     if use_fsdp:
         wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=int(args.fsdp_wrap_min_params))
         # Set FSDP mixed precision to match chosen dtype
-        mp_policy = None
-        if dtype == torch.bfloat16:
-            mp_policy = MixedPrecision(param_dtype=torch.float32, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16)
-        elif dtype == torch.float16:
-            mp_policy = MixedPrecision(param_dtype=torch.float32, reduce_dtype=torch.float16, buffer_dtype=torch.float16)
+        # if dtype == torch.bfloat16:
+        #     mp_policy = MixedPrecision(param_dtype=torch.float32, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16)
+        # For FP16, disable mixed precision to avoid conflicts with ShardedGradScaler
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         model = FSDP(model, auto_wrap_policy=wrap_policy, mixed_precision=mp_policy, device_id=local_rank)
     else:
@@ -237,12 +243,22 @@ def train(args):
 
     # Optional per-layer NaN/Inf forward detection (rank0 only)
     nan_hook_handles: List[Any] = []
-    
+    if args.debug_nan and is_master:
+        for name, module in model.named_modules():
+            if "layer" in name or "attn" in name:  # Focus on key layers
+                handle = module.register_forward_hook(nan_inf_hook(name))
+                nan_hook_handles.append(handle)
 
     # Optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     # AMP scaler only for FP16 training
-    scaler = GradScaler('cuda') if dtype == torch.float16 else None
+    if dtype == torch.float16:
+        if use_fsdp:
+            scaler = ShardedGradScaler()
+        else:
+            scaler = GradScaler('cuda')
+    else:
+        scaler = None
 
     # Data
     ds = JsonlSFTDataset(args.train_json, input_key=args.input_key, target_key=args.target_key)
@@ -295,6 +311,12 @@ def train(args):
         def compute_safe_ce_loss():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             logits = outputs.logits  # [B,S,V]
+            # Debug logit stats (rank0 only)
+            if is_master and (steps % args.log_every == 0 or steps <= 5):
+                logit_mean = logits.mean().item()
+                logit_min = logits.min().item()
+                logit_max = logits.max().item()
+                print(json.dumps({"debug_logits": {"mean": round(logit_mean, 2), "min": round(logit_min, 2), "max": round(logit_max, 2)}}))
             # Sanitize logits to avoid NaNs/Infs propagating into CE
             logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
             # Shift for causal LM
@@ -315,8 +337,8 @@ def train(args):
         autocast_dtype = torch.bfloat16 if dtype == torch.bfloat16 else (torch.float16 if dtype == torch.float16 else None)
         if autocast_dtype is not None:
             with autocast(dtype=autocast_dtype, device_type='cuda'):
-                loss = compute_safe_ce_loss()
-                # loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
+                # loss = compute_safe_ce_loss()
+                loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
         else:
             loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
             # loss = compute_safe_ce_loss()
@@ -475,7 +497,7 @@ def parse_args():
     p.add_argument("--grad_accum_steps", type=int, default=1)
     p.add_argument("--lr", type=float, default=0)
     p.add_argument("--wd", type=float, default=0.1)
-    p.add_argument("--max_grad_norm", type=float, default=0.1)
+    p.add_argument("--max_grad_norm", type=float, default=0.01)
     p.add_argument("--max_steps", type=int, default=100)
     # fsdp
     p.add_argument("--fsdp_wrap_min_params", type=float, default=1e7, help="Auto-wrap modules above this param count")
