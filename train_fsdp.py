@@ -27,6 +27,8 @@ from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.distributed.fsdp import MixedPrecision
+from torch.cuda.amp import GradScaler, autocast
+import torch.nn.functional as F
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -148,14 +150,32 @@ def all_reduce_mean(x: torch.Tensor) -> torch.Tensor:
 
 
 def save_fsdp_full(model: FSDP, out_dir: str, step: int):
-    if dist.get_rank() != 0:
-        return
     out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if dist.get_rank() == 0:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    # Ensure directory exists before any rank proceeds
+    dist.barrier()
+    # All ranks must participate in FULL_STATE_DICT gathering even with rank0_only=True
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
         state = model.state_dict()
+    if dist.get_rank() == 0:
         torch.save(state, out_dir / f"checkpoint_step{step}.pt")
+    # Synchronize after saving to avoid shutdown races
+    dist.barrier()
 
+
+def save_plain_full(model: torch.nn.Module, out_dir: str, step: int):
+    out_dir = Path(out_dir)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank == 0:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    if dist.is_initialized():
+        dist.barrier()
+    state = model.state_dict()
+    if rank == 0:
+        torch.save(state, out_dir / f"checkpoint_step{step}.pt")
+    if dist.is_initialized():
+        dist.barrier()
 
 # ---------------------------
 # Main Training Loop
@@ -174,7 +194,9 @@ def train(args):
         tok.pad_token = tok.eos_token
 
     # Load model
-    dtype = torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else torch.float32
+    # Choose dtype explicitly. To run pure FP32, set dtype=torch.float32 below.
+    # dtype = torch.bfloat16 if args.bf16 else torch.float16 if args.fp16 else torch.float32
+    dtype = torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         dtype=dtype,
@@ -182,21 +204,73 @@ def train(args):
     model_gradient_ckpt_supported = hasattr(model, "gradient_checkpointing_enable")
     if args.use_activation_checkpointing and model_gradient_ckpt_supported:
         model.gradient_checkpointing_enable()
-
-    # FSDP config
-    wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=int(args.fsdp_wrap_min_params))
+    model.config.use_cache = False
+    # model.config.attn_implementation = "eager"
     mp_policy = None
-    if args.bf16:
-        mp_policy = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16)
-    elif args.fp16:
-        mp_policy = MixedPrecision(param_dtype=torch.float16, reduce_dtype=torch.float16, buffer_dtype=torch.float16)
 
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    model = FSDP(model, auto_wrap_policy=wrap_policy, mixed_precision=mp_policy, device_id=local_rank)
+    # FSDP config (optional)
+    use_fsdp = not getattr(args, "no_fsdp", False)
+    if use_fsdp:
+        wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=int(args.fsdp_wrap_min_params))
+        # Set FSDP mixed precision to match chosen dtype
+        mp_policy = None
+        if dtype == torch.bfloat16:
+            mp_policy = MixedPrecision(param_dtype=torch.float32, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16)
+        elif dtype == torch.float16:
+            mp_policy = MixedPrecision(param_dtype=torch.float32, reduce_dtype=torch.float16, buffer_dtype=torch.float16)
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        model = FSDP(model, auto_wrap_policy=wrap_policy, mixed_precision=mp_policy, device_id=local_rank)
+    else:
+        model = model.to(device)
+
+    # Attention implementation selectable
+    try:
+        model.config.attn_implementation = getattr(args, "attn_impl", "eager")
+    except Exception:
+        model.config.attn_implementation = "eager"
+    torch.backends.cuda.enable_flash_sdp(False)
+
+    # Optional: autograd anomaly detection for debugging backward NaNs (slow)
+    if getattr(args, "debug_autograd", False):
+        torch.autograd.set_detect_anomaly(True)
+
+    # Optional per-layer NaN/Inf forward detection (rank0 only)
+    nan_hook_handles: List[Any] = []
+    if getattr(args, "debug_nan", False) and is_master:
+        def _iter_tensors(x):
+            if torch.is_tensor(x):
+                yield x
+            elif isinstance(x, (list, tuple)):
+                for y in x:
+                    yield from _iter_tensors(y)
+            elif isinstance(x, dict):
+                for y in x.values():
+                    yield from _iter_tensors(y)
+
+        def _make_hook(mod_name: str):
+            def _hook(_mod, _inp, _out):
+                try:
+                    for t in _iter_tensors(_out):
+                        if t is None:
+                            continue
+                        if not torch.isfinite(t).all():
+                            num_nonfinite = int((~torch.isfinite(t)).sum().item())
+                            print(json.dumps({"nan_forward": True, "module": mod_name, "num_nonfinite": num_nonfinite}))
+                            break
+                except Exception:
+                    pass
+            return _hook
+
+        for name, module in model.named_modules():
+            # Only hook leaf modules to reduce noise
+            if len(list(module.children())) == 0:
+                h = module.register_forward_hook(_make_hook(name))
+                nan_hook_handles.append(h)
 
     # Optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
-    scaler = None  # BF16 usually doesn't need scaler; keep for FP16 if desired
+    # AMP scaler only for FP16 training
+    scaler = GradScaler() if dtype == torch.float16 else None
 
     # Data
     ds = JsonlSFTDataset(args.train_json, input_key=args.input_key, target_key=args.target_key)
@@ -246,16 +320,82 @@ def train(args):
         # Count tokens (labels != -100)
         total_tokens_this_step += int((labels != -100).sum().item())
 
-        loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
+        def compute_safe_ce_loss():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits  # [B,S,V]
+            # Sanitize logits to avoid NaNs/Infs propagating into CE
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+            # Shift for causal LM
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            # Flatten
+            vocab = shift_logits.size(-1)
+            flat_logits = shift_logits.view(-1, vocab).float()  # compute CE in FP32 for stability
+            flat_labels = shift_labels.view(-1)
+            valid_mask = flat_labels != -100
+            num_valid = int(valid_mask.sum().item())
+            if num_valid == 0:
+                return torch.tensor(0.0, device=device, dtype=torch.float32)
+            # CE on valid positions only
+            loss_sum = F.cross_entropy(flat_logits[valid_mask], flat_labels[valid_mask], reduction="sum")
+            return loss_sum / num_valid
+
+        autocast_dtype = torch.bfloat16 if dtype == torch.bfloat16 else (torch.float16 if dtype == torch.float16 else None)
+        if autocast_dtype is not None:
+            with autocast(dtype=autocast_dtype):
+                loss = compute_safe_ce_loss()
+        else:
+            # loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
+            loss = compute_safe_ce_loss()
+
         loss = loss / args.grad_accum_steps
-        loss.backward()
+        # Guard against non-finite loss to avoid poisoning optimizer state
+        if not torch.isfinite(loss):
+            if is_master:
+                # Minimal diagnostics
+                num_valid_tokens = int((labels[:, 1:] != -100).sum().item())
+                print(json.dumps({"warning": "non_finite_loss", "step": int(steps+1), "valid_tokens": num_valid_tokens}))
+            opt.zero_grad(set_to_none=True)
+            # Skip this micro-step and continue
+            continue
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        # Optional: sanitize gradients to avoid NaN/Inf propagation
+        if getattr(args, "sanitize_grads", False):
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+                    p.grad.clamp_(min=-1e3, max=1e3)
+        # Check gradient finiteness and skip bad micro-steps to protect weights
+        bad_grad = False
+        for p in model.parameters():
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                bad_grad = True
+                break
+        if bad_grad:
+            if is_master:
+                print(json.dumps({"warning": "non_finite_grad", "step": int(steps+1)}))
+            opt.zero_grad(set_to_none=True)
+            continue
         total_loss += loss.detach().float().item()
 
         if (steps + 1) % args.grad_accum_steps == 0:
-            if args.max_grad_norm > 0:
-                clip_grad_norm_(model.parameters(), args.max_grad_norm)
-            opt.step()
-            opt.zero_grad(set_to_none=True)
+            if scaler is not None:
+                if args.max_grad_norm > 0:
+                    scaler.unscale_(opt)
+                    clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad(set_to_none=True)
+            else:
+                if args.max_grad_norm > 0:
+                    clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
 
         # --------------- metrics ---------------
         step_compute = time.time() - step_compute_t0
@@ -263,11 +403,11 @@ def train(args):
         t_toks = torch.tensor([total_tokens_this_step], device=device, dtype=torch.float64)
         t_loss = torch.tensor([total_loss * args.grad_accum_steps], device=device, dtype=torch.float64)
         t_step = torch.tensor([step_compute], device=device, dtype=torch.float64)
-        dist.all_reduce(t_toks, op=dist.ReduceOp.SUM)
-        dist.all_reduce(t_loss, op=dist.ReduceOp.SUM)
-        dist.all_reduce(t_step, op=dist.ReduceOp.MAX)  # step time = max across ranks
-
-        world = dist.get_world_size()
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(t_toks, op=dist.ReduceOp.SUM)
+            dist.all_reduce(t_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(t_step, op=dist.ReduceOp.MAX)
+        world = dist.get_world_size() if dist.is_initialized() else 1
         global_tokens = int(t_toks.item())
         global_loss = float(t_loss.item() / world)
         step_time = float(t_step.item())
@@ -329,10 +469,16 @@ def train(args):
                     json.dump(debug_rows, f, ensure_ascii=False, indent=2)
 
         if args.save_ckpt_every > 0 and steps % args.save_ckpt_every == 0:
-            save_fsdp_full(model, args.output_dir, steps)
+            if use_fsdp:
+                save_fsdp_full(model, args.output_dir, steps)
+            else:
+                save_plain_full(model, args.output_dir, steps)
 
     # final checkpoint
-    save_fsdp_full(model, args.output_dir, steps)
+    if use_fsdp:
+        save_fsdp_full(model, args.output_dir, steps)
+    else:
+        save_plain_full(model, args.output_dir, steps)
     # Cleanly shutdown the process group to avoid resource leak warnings
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -347,18 +493,24 @@ def parse_args():
     p.add_argument("--target_key", type=str, default="target")
     # training
     p.add_argument("--seq_len", type=int, default=1024)
-    p.add_argument("--bf16", action="store_true")
-    p.add_argument("--fp16", action="store_true")
+    p.add_argument("--bf16", action="store_false")
+    p.add_argument("--fp16", action="store_false")
     p.add_argument("--use_activation_checkpointing", action="store_true")
     p.add_argument("--pack_sequences", action="store_true")
     p.add_argument("--micro_batch_size", type=int, default=1)
     p.add_argument("--grad_accum_steps", type=int, default=1)
-    p.add_argument("--lr", type=float, default=2e-5)
+    p.add_argument("--lr", type=float, default=0)
     p.add_argument("--wd", type=float, default=0.1)
-    p.add_argument("--max_grad_norm", type=float, default=1.0)
-    p.add_argument("--max_steps", type=int, default=200)
+    p.add_argument("--max_grad_norm", type=float, default=0.1)
+    p.add_argument("--max_steps", type=int, default=100)
     # fsdp
     p.add_argument("--fsdp_wrap_min_params", type=float, default=1e7, help="Auto-wrap modules above this param count")
+    p.add_argument("--no_fsdp", action="store_true", help="Disable FSDP and run single-device training")
+    # debugging/toggles
+    p.add_argument("--debug_autograd", action="store_true", help="Enable autograd anomaly detection (slow)")
+    p.add_argument("--sanitize_grads", action="store_true", help="Replace NaN/Inf grads with 0 and clamp gradients")
+    p.add_argument("--attn_impl", type=str, default="eager", choices=["eager", "sdpa"], help="Attention implementation")
+    p.add_argument("--debug_nan", action="store_true", help="Enable per-layer forward NaN/Inf detection on rank0")
     # logging / io
     p.add_argument("--log_every", type=int, default=20)
     p.add_argument("--debug_per_sample_loss", action="store_true")

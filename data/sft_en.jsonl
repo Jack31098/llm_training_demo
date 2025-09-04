@@ -1,3 +1,122 @@
+{"input":"Define gradient clipping in training.","target":"Gradient clipping limits the global norm or per-parameter magnitude of gradients to prevent exploding updates and stabilize optimization."}
+{"input":"What does AdamW change compared to Adam?","target":"AdamW decouples weight decay from the gradient-based update, applying true L2 regularization for better generalization."}
+{"input":"In one line, explain weight decay.","target":"Weight decay shrinks parameters toward zero each step to reduce overfitting and improve generalization."}
+{"input":"Why use learning-rate warmup?","target":"Warmup gradually ramps the learning rate to avoid instability while optimizer moments are uncalibrated early in training."}
+{"input":"Summarize cosine decay scheduling.","target":"Cosine decay smoothly decreases the learning rate following a half-cosine curve, often improving final convergence."}
+{"input":"What is label smoothing?","target":"Label smoothing replaces one-hot targets with a slightly softened distribution to reduce overconfidence and improve calibration."}
+{"input":"Purpose of dropout in Transformers?","target":"Dropout randomly zeroes activations to reduce co-adaptation and overfitting, acting as a regularizer."}
+{"input":"Explain early stopping.","target":"Early stopping halts training when validation metrics stop improving to prevent overfitting."}
+{"input":"Why keep frequent checkpoints?","target":"Frequent checkpoints enable recovery, regression analysis, and ablation without rerunning full training."}
+{"input":"One sentence on mixed precision.","target":"Mixed precision uses lower-precision compute and storage where safe to reduce memory and increase throughput while preserving accuracy."}
+{"input":"BF16 vs FP16: key difference?","target":"BF16 keeps 8-bit exponent like FP32, providing larger dynamic range and stable training without loss scaling."}
+{"input":"Why is loss scaling used?","target":"Loss scaling multiplies the loss to keep small gradients representable in FP16, avoiding underflow."}
+{"input":"Explain the risk of too large learning rate.","target":"An overly large learning rate can cause divergence, NaNs, or bouncing around minima due to oversized updates."}
+{"input":"BatchNorm vs LayerNorm in Transformers?","target":"Transformers use LayerNorm which normalizes across features per token and is stable for variable sequence lengths."}
+{"input":"RMSNorm in one sentence.","target":"RMSNorm scales activations by their root-mean-square without mean-centering, improving stability with fewer operations."}
+{"input":"Why do we use residual connections?","target":"Residual connections ease optimization by providing gradient highways and preserving information across layers."}
+{"input":"Encoder-only vs decoder-only in a line.","target":"Encoder-only models produce contextualized representations, while decoder-only models predict next tokens autoregressively."}
+{"input":"What is a causal mask?","target":"A causal mask prevents a token from attending to future positions to enforce autoregressive generation."}
+{"input":"Padding mask vs causal mask?","target":"Padding masks hide padded positions, while causal masks restrict attention to past tokens only."}
+{"input":"Rotary position embeddings (RoPE) brief.","target":"RoPE encodes positions by rotating query/key vectors in a complex plane, enabling extrapolation and relative behavior."}
+{"input":"ALiBi in one line.","target":"ALiBi adds position-dependent biases to attention scores, enabling longer contexts without learned positional embeddings."}
+{"input":"Absolute vs relative position embeddings.","target":"Absolute embeddings assign fixed position vectors, while relative approaches model distance-dependent effects directly in attention."}
+{"input":"Define KV cache.","target":"KV cache stores past keys and values for reuse during autoregressive decoding to avoid recomputation."}
+{"input":"Why paged KV cache?","target":"Paged KV cache chunks cache memory into pages to reduce fragmentation and enable efficient memory management for many requests."}
+{"input":"What is continuous batching?","target":"Continuous batching dynamically adds/removes sequences to ongoing batches to improve GPU utilization in serving."}
+{"input":"Speculative decoding one-liner.","target":"Speculative decoding drafts tokens with a faster model and verifies them with the target model to reduce latency."}
+{"input":"Beam search vs sampling?","target":"Beam search explores high-probability sequences deterministically, while sampling draws stochastic outputs for diversity."}
+{"input":"Briefly define nucleus sampling.","target":"Nucleus sampling draws from the smallest probability mass whose cumulative sum exceeds p, promoting fluent yet diverse text."}
+{"input":"Effect of temperature in decoding.","target":"Higher temperature flattens the distribution for more diverse outputs; lower temperature sharpens it for more deterministic text."}
+{"input":"What is repetition penalty?","target":"Repetition penalty downweights previously generated tokens to reduce loops and repetitive outputs."}
+{"input":"BOS and EOS tokens purpose.","target":"BOS/EOS mark sequence boundaries to condition generation and determine when to stop decoding."}
+{"input":"BPE vs Unigram tokenizer summary.","target":"BPE merges frequent pairs to form subwords, while Unigram trains a probabilistic subword vocabulary optimized by likelihood."}
+{"input":"Why byte fallback matters?","target":"Byte fallback guarantees coverage for unseen characters by decomposing them into bytes, avoiding unknown token errors."}
+{"input":"Common detokenization pitfall?","target":"Mishandling spaces and special tokens can create artifacts like doubled spaces or broken punctuation."}
+{"input":"Define data leakage.","target":"Data leakage occurs when evaluation or training data contains information from the test distribution in unintended ways."}
+{"input":"Train/val/test split principle.","target":"Splits should be stratified and time-aware when needed to ensure fair evaluation and prevent leakage."}
+{"input":"Determinism in training: one line.","target":"Setting seeds and controlling nondeterministic ops improves reproducibility but may reduce throughput."}
+{"input":"Gradient checkpointing trade-off.","target":"Gradient checkpointing saves memory by recomputing activations at the cost of extra compute."}
+{"input":"Activation offload in a sentence.","target":"Activation offload moves stored activations to CPU or NVMe to fit larger models at slower speed."}
+{"input":"CPU offload for FSDP.","target":"FSDP can offload parameter shards to CPU between steps to reduce GPU memory pressure when bandwidth allows."}
+{"input":"ZeRO-3 vs FSDP at a glance.","target":"Both shard params, grads, and optimizer states; FSDP is PyTorch-native, ZeRO-3 is the DeepSpeed counterpart with similar goals."}
+{"input":"DDP vs FSDP short answer.","target":"DDP replicates full parameters on each rank, while FSDP shards them to save memory at extra communication cost."}
+{"input":"Why can TP be slow on PCIe?","target":"TP adds per-layer all-reduce/all-gather that become latency-bound on PCIe, often hurting end-to-end throughput."}
+{"input":"Pipeline parallelism bubble.","target":"PP suffers pipeline bubbles when stages idle during warmup and drain, mitigated by more micro-batches or interleaving."}
+{"input":"1F1B schedule in a line.","target":"1F1B alternates forward and backward micro-batches across stages to reduce bubbles and balance memory."}
+{"input":"Interleaved pipeline idea.","target":"Interleaving splits each stage into virtual chunks to increase overlap and reduce pipeline bubbles."}
+{"input":"Sequence parallelism purpose.","target":"Sequence parallelism splits sequence length across devices to reduce activation memory and balance compute."}
+{"input":"LoRA in one sentence.","target":"LoRA fine-tunes low-rank adapters injected into weight matrices to adapt models efficiently."}
+{"input":"What is QLoRA?","target":"QLoRA combines 4-bit base model quantization with LoRA adapters to fine-tune on limited GPU memory."}
+{"input":"LoRA rank trade-off.","target":"Higher LoRA rank increases capacity but costs more memory and may overfit small datasets."}
+{"input":"Adapter dropout rationale.","target":"Adapter dropout regularizes adapter activations to prevent overfitting during parameter-efficient tuning."}
+{"input":"Prefix-tuning in a line.","target":"Prefix-tuning learns virtual token prefixes that steer generation without changing backbone weights."}
+{"input":"When to use PEFT vs full fine-tune?","target":"Use PEFT for task adaptation under memory/compute constraints; full fine-tuning when you can afford it and need maximal capacity."}
+{"input":"INT8 vs INT4 quantization difference.","target":"INT8 preserves more precision and is easier to deploy, while INT4 yields larger memory and bandwidth savings with higher risk."}
+{"input":"SmoothQuant briefly.","target":"SmoothQuant shifts scale from activations to weights to smooth activation ranges and enable INT8 quantization without calibration data."}
+{"input":"What is AWQ?","target":"AWQ selects and protects critical weight channels during quantization to preserve accuracy at low bit-widths."}
+{"input":"GPTQ in one line.","target":"GPTQ quantizes weights by minimizing reconstruction error layer-wise, often achieving strong accuracy at 4-bit."}
+{"input":"Activation vs weight quantization.","target":"Weight quantization reduces model size, while activation quantization reduces runtime bandwidth and cache pressure."}
+{"input":"Why need a calibration set?","target":"Calibration data estimates activation ranges and distributions to set quantization scales safely."}
+{"input":"Perplexity definition.","target":"Perplexity is the exponential of average negative log-likelihood, measuring how well a model predicts text."}
+{"input":"Accuracy vs F1 summary.","target":"Accuracy measures overall correctness; F1 balances precision and recall for imbalanced tasks."}
+{"input":"AUC-ROC vs AUC-PR.","target":"AUC-ROC is insensitive to class imbalance, while AUC-PR focuses on performance for the positive class under imbalance."}
+{"input":"Define NDCG.","target":"NDCG measures ranking quality by discounting gains at lower ranks and normalizing against the ideal order."}
+{"input":"MRR in a sentence.","target":"MRR is the average reciprocal rank of the first relevant item across queries."}
+{"input":"MAP one-liner.","target":"MAP averages precision across all recall points for each query and then across queries."}
+{"input":"CTR metric quick note.","target":"CTR is clicks divided by impressions and is often optimized with calibration to align with business goals."}
+{"input":"What is ECE?","target":"Expected Calibration Error summarizes the gap between predicted probabilities and observed frequencies across bins."}
+{"input":"Temperature scaling for calibration.","target":"Temperature scaling fits a single scalar to logits to improve probability calibration without changing rankings."}
+{"input":"Confusion matrix summary.","target":"A confusion matrix counts true/false positives/negatives to visualize classification errors."}
+{"input":"ROC curve definition.","target":"ROC plots true positive rate versus false positive rate across thresholds to show the trade-off."}
+{"input":"Precision–recall curve definition.","target":"PR curve plots precision versus recall across thresholds, informative for imbalanced datasets."}
+{"input":"Offline vs online evaluation.","target":"Offline evaluation uses held-out data, while online evaluation measures user impact in real traffic."}
+{"input":"What is an A/B test?","target":"An A/B test randomly splits users to compare variants and estimate causal impact."}
+{"input":"Shadow traffic in serving.","target":"Shadow traffic replays live requests to a candidate system without affecting users to validate behavior and cost."}
+{"input":"Canary analysis in deployment.","target":"Canary gradually rolls out a change to a small subset to detect regressions before full release."}
+{"input":"Batch size vs memory trade-off.","target":"Larger batches improve throughput but require more memory and may need learning rate adjustments."}
+{"input":"Gradient noise scale intuition.","target":"Gradient noise scale estimates how batch size relates to optimization noise to guide scaling rules."}
+{"input":"Throughput vs latency distinction.","target":"Throughput is items per unit time, while latency is time per item; they often trade off."}
+{"input":"Define tokens per second.","target":"Tokens per second measures how many tokens the system trains or generates per second, reflecting end-to-end performance."}
+{"input":"Effective batch size formula.","target":"Effective batch size equals micro_batch_size × grad_accum_steps × number_of_data_parallel_replicas."}
+{"input":"Dataloader prefetching benefit.","target":"Prefetching overlaps data preparation with compute to reduce idle GPU time."}
+{"input":"What is pinned memory?","target":"Pinned (page-locked) host memory speeds up H2D/D2H transfers by avoiding page faults and enabling DMA."}
+{"input":"Overlap compute and transfer.","target":"Using nonblocking copies and streams overlaps H2D/D2H transfers with kernel execution to hide latency."}
+{"input":"Bucketing sequences helps how?","target":"Bucketing groups similar sequence lengths to reduce padding and improve packing efficiency."}
+{"input":"Left vs right padding?","target":"Right padding is standard for causal LMs; left padding simplifies some decoder-only batching at inference."}
+{"input":"How to handle EOS in labels?","target":"Mask labels after EOS with -100 so the loss ignores tokens beyond the end of sequence."}
+{"input":"Masked tokens in loss, why -100?","target":"-100 is a conventional ignore index in PyTorch’s cross-entropy that excludes positions from loss."}
+{"input":"Teacher forcing definition.","target":"Teacher forcing feeds ground-truth tokens during training to stabilize autoregressive learning."}
+{"input":"Scheduled sampling in one line.","target":"Scheduled sampling gradually replaces teacher inputs with model predictions to reduce exposure bias."}
+{"input":"Curriculum learning short note.","target":"Curriculum learning orders training from easy to hard examples to ease optimization and improve robustness."}
+{"input":"Multi-task learning objective.","target":"Multi-task learning shares a backbone across related tasks to improve data efficiency and generalization."}
+{"input":"RLHF in a sentence.","target":"RLHF optimizes a policy to align with human preferences using a learned reward model and policy optimization."}
+{"input":"DPO briefly.","target":"DPO optimizes preferences directly from chosen versus rejected responses without an explicit reward model."}
+{"input":"What is a reward model?","target":"A reward model predicts relative preference or scalar reward for outputs to guide alignment."}
+{"input":"RAG purpose in one line.","target":"RAG augments generation with retrieved documents to ground answers and reduce hallucinations."}
+{"input":"Chunk size choice in RAG.","target":"Choose chunk sizes that balance semantic completeness with retriever recall—often 256–1024 tokens."}
+{"input":"HNSW vs IVF-PQ in FAISS.","target":"HNSW provides high-recall graph search with low latency, while IVF-PQ compresses vectors to save memory at some recall cost."}
+{"input":"Cosine vs inner product similarity.","target":"Cosine normalizes vector length, while inner product is sensitive to magnitude; both are common for embeddings."}
+{"input":"When to normalize embeddings?","target":"Normalize when using cosine similarity or when magnitude carries little meaning to stabilize retrieval."}
+{"input":"Negative mining for retrieval.","target":"Hard negative mining surfaces confusing negatives to improve discriminative training of retrievers."}
+{"input":"Cross-encoder vs bi-encoder.","target":"Cross-encoders re-score pairs with full attention for accuracy, while bi-encoders embed separately for scalability."}
+{"input":"MRR vs NDCG when to use?","target":"Use MRR for single-relevant-item tasks; use NDCG when multiple items have graded relevance."}
+{"input":"Why gradient clipping may hide issues?","target":"Clipping can mask exploding gradients; if needed persistently, reconsider learning rate or initialization."}
+{"input":"Why set random seeds?","target":"Seeds enable reproducible results and fair ablations across code changes and hyperparameters."}
+{"input":"Define learning rate warmdown.","target":"Warmdown gradually decays the learning rate after a plateau to refine convergence."}
+{"input":"What is gradient accumulation off-by-one pitfall?","target":"Forgetting to divide loss by grad_accum_steps or stepping the optimizer too often skews the effective learning rate."}
+{"input":"Why shuffle each epoch?","target":"Shuffling breaks correlations between adjacent samples and improves SGD’s variance properties."}
+{"input":"What does reduce-scatter in backward do?","target":"Reduce-scatter sums and shards gradients during backward to overlap communication with compute in FSDP/ZeRO."}
+{"input":"All-gather in forward serves what?","target":"All-gather assembles parameter shards before compute so each rank has the needed weights for the layer."}
+{"input":"Gradient bucketing rationale.","target":"Bucketing groups gradients to amortize communication startup costs and enable better overlap."}
+{"input":"Why clip by value is risky?","target":"Clipping by value can distort direction severely; norm clipping preserves direction better."}
+{"input":"One sentence on EMA of weights.","target":"Exponential moving average of weights smooths updates and can improve evaluation stability."}
+{"input":"How to detect data leaks quickly?","target":"Track near-duplicate hashes across splits and monitor suspiciously low validation loss versus training."}
+{"input":"Why checkpoint shards matter?","target":"Sharded checkpoints reduce save/load memory and speed for large models across distributed ranks."}
+{"input":"What is ZeRO offload?","target":"ZeRO offload moves optimizer states or gradients to CPU/NVMe to fit larger models at higher latency."}
+{"input":"Parameter tying benefits.","target":"Tying input embeddings and output head reduces parameters and can improve sample efficiency."}
+{"input":"When to untie embeddings?","target":"Untie when decoupling input and output spaces helps, such as multilingual vocabularies or special decoding heads."}
+{"input":"Define gradient starvation.","target":"Gradient starvation occurs when some features rarely receive strong gradients, slowing learning for those pathways."}
+{"input":"Short note on optimizer bias correction.","target":"Adam-style optimizers correct biased moment estimates in early steps to stabilize updates."}
 {"input":"In one sentence, explain gradient accumulation for training.","target":"Gradient accumulation sums losses and gradients over multiple micro-batches before a single optimizer step to emulate a larger effective batch without extra memory."}
 {"input":"Define FlashAttention briefly.","target":"FlashAttention is a fused, blockwise attention kernel that reduces high-bandwidth memory traffic and intermediate activations to speed up long-context attention."}
 {"input":"Why is tensor parallelism often disabled on PCIe machines?","target":"Because TP introduces per-layer synchronization that is latency-dominated on PCIe, which is hard to hide with short-to-medium sequences, leading to negative end-to-end gains."}
