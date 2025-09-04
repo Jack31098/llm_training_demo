@@ -1,3 +1,14 @@
+Current status & limitations
+
+AOTriton FlashAttention (PyTorch 2.8, ROCm): non-None attn_mask is not supported through the SDPA integration. Our training data pipeline requires attention masks, so FA cannot be used on masked batches.
+
+SDPA memory-efficient attention (MEA): does not support GQA (num_heads_q != num_heads_kv). Emulating GQA by tiling/broadcasting K/V inside the kernel introduces extra copies and negates the expected speed/VRAM gains.
+
+Fallback in this repo: training currently uses either the eager attention path or SDPA with the math backend.
+
+We’ll update this section once kernel support for masked FA and GQA-aware MEA is available.
+
+
 Goal
 
 Demonstrate supervised fine-tuning (SFT) of a Qwen-class 8B decoder using FSDP and FSDP + 2-way Pipeline Parallel (PP) on an AMD EPYC 7403 + 2× MI100 (gfx908) node.
@@ -29,3 +40,4 @@ Python: 3.12
 PyTorch: 2.8 (ROCm build), torch.distributed backend = "nccl" (RCCL)
 Optional: SDPA’s FlashAttention backend on ROCm/gfx908 (feature-gated)
 Tokenizer/Models: Qwen3-class 8B decoder (HF style)
+
