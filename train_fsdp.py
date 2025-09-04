@@ -234,8 +234,8 @@ def train(args):
     model.config.attn_implementation = getattr(args, "attn_impl")
     
     torch.backends.cuda.enable_flash_sdp(False)
-    torch.backends.cuda.enable_math_sdp(False)
-    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
     # print(torch.backends.cuda.flash_sdp_enabled())
     # print(torch.backends.cuda.mem_efficient_sdp_enabled())
     # print(torch.backends.cuda.math_sdp_enabled())
