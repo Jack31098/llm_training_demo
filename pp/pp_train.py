@@ -17,14 +17,18 @@ class Qwen3InputPipe(nn.Module):
         return (hidden_states, attention_mask, position_ids)
 
 class Qwen3OutputPipe(nn.Module):
-    def __init__(self, tie_lm_head: nn.Linear, rms_norm):
+    def __init__(self, rmsnorm, d_model: int, vocab: int, tie_weight: Optional[nn.Parameter] = None):
         super().__init__()
-        self.norm = rms_norm
-        self.lm_head = tie_lm_head
+        self.norm = rmsnorm
+        self.lm_head = nn.Linear(d_model, vocab, bias=False)
+        if tie_weight is not None:
+            # 单进程/同 stage 才能共享同一 Parameter
+            self.lm_head.weight = tie_weight  # 不要 .clone() / .detach()
+
     def forward(self, x):
-        hidden_states, *_ = x
-        hs = self.norm(hidden_states)
-        logits = self.lm_head(hs)   # [B, S, vocab]
+        # DeepSpeed 可能把 (hidden_states, labels) 作为 tuple 传到最后一段
+        hidden_states = x[0] if isinstance(x, (tuple, list)) else x
+        logits = self.lm_head(self.norm(hidden_states))   # [B, S, vocab]
         return logits
 
 def _normalize_tuple(x):
@@ -77,10 +81,8 @@ def build_pipeline(args):
 
     layers = []
     layers.append(TiedLayerSpec("tok_embed", qwen3_model.model.embed_tokens, qwen3_model.model.vocab_size, d_model, args.seq_len))
-    for _ in range(n_layer // 2):
-        layers.append(LayerSpec(Block, d_model, n_head, 4))
-    for _ in range(n_layer // 2):
-        layers.append(LayerSpec(Block, d_model, n_head, 4))
+    for lid in range(n_layer):
+        layers.append(LayerSpec(Qwen3DecoderLayerPipe, decoder_layers[lid], lid))
     head = LayerSpec(LMHead, d_model, vocab)
     layers.append(head)
 
