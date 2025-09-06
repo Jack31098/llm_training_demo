@@ -3,23 +3,14 @@ import deepspeed
 import torch
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 from torch.utils.data import Dataset, DataLoader
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+from input_pipe import Qwen3InputPipe
 
-
-class Qwen3InputPipe(nn.Module):
-    def __init__(self, tie_embed: nn.Embedding):
-        super().__init__()
-        self.embed_tokens = tie_embed
-    def forward(self, batch:dict[str, torch.Tensor])->tuple:
-        input_ids        = batch["input_ids"]
-        attention_mask   = batch.get("attention_mask", None)
-        position_ids     = batch.get("position_ids", None)
-        hidden_states = self.embed_tokens(input_ids)
-        return (hidden_states, attention_mask, position_ids)
 
 class Qwen3OutputPipe(nn.Module):
-    def __init__(self, rmsnorm, d_model: int, vocab: int, tie_weight: Optional[nn.Parameter] = None):
+    def __init__(self, d_model: int, vocab: int, tie_weight: Optional[nn.Parameter] = None):
         super().__init__()
-        self.norm = rmsnorm
+        self.norm = Qwen3RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab, bias=False)
         if tie_weight is not None:
             # 单进程/同 stage 才能共享同一 Parameter
@@ -44,15 +35,15 @@ def _normalize_tuple(x):
     return x
 
 class Qwen3DecoderLayerPipe(nn.Module):
-    """takes in a tuple, unpack it to call Qwen3DecoderLayer, then pass everything down"""
-    def __init__(self, decoder_block, layer_idx: int):
+    """Wrap Qwen3DecoderLayer to accept/return a tuple for pipeline."""
+    def __init__(self, config, layer_idx: int):
         super().__init__()
-        self.block = decoder_block
+        self.block = Qwen3DecoderLayer(config, layer_idx)
         self.layer_idx = layer_idx
 
     def forward(self, x):
-        # tuple structure convention: hidden_states, attention_mask are required, others are optional
-        # (hidden_states, attention_mask, position_ids, past_key_values, use_cache, cache_position, position_embeddings)
+        # tuple structure convention: hidden_states, attention_mask are required, others are optional 
+        # (hidden_states, attention_mask, position_ids, past_key_values, use_cache, cache_position, position_embeddings, kw)
         hs, am, pid, pkv, use_cache, cp, pos_emb, kw = _normalize_tuple(x)
         hs = self.block(
             hidden_states=hs, attention_mask=am, position_ids=pid,
@@ -63,52 +54,47 @@ class Qwen3DecoderLayerPipe(nn.Module):
 
 def build_pipeline(args):
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
-    print("passin dtype", dtype)
-    tok = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
-    qwen3_model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        dtype=dtype,
-    )
-    decoder_layers = qwen3_model.model.layers
-    n_layer = len(decoder_layers)
-    d_model = qwen3_model.model.embed_tokens.embedding_dim
-    pad_id  = tok.pad_token or tok.eos_token
 
-    emb_tied = emb_tied = TiedLayerSpec(
-        "tok_embed",              # tied_id，input output should be the same
-        nn.Embedding, vocab_size, d_model, padding_idx=pad_id)
-    lm_tied  = TiedLayerSpec("tok_embed", nn.Linear, hidden, vocab_size, bias=False)
+    tok = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
+    pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+
+    # load the model on cpu first
+    # this is not the general way to load model
+    # when the model is very large, any rank should load its own params
+    qwen3 = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path,
+        torch_dtype=dtype,
+        device_map="cpu",               #  config + state_dict for later loading into gpu
+        low_cpu_mem_usage=True,
+    )
+    cfg      = qwen3.config
+    n_layer  = cfg.num_hidden_layers
+    d_model  = cfg.hidden_size
+    vocabsz  = cfg.vocab_size
+
+    # TiedLayerSpec：same name= "tok_embed" it means different stages share the same weight
+    embed_tied = TiedLayerSpec("tok_embed", torch.nn.Embedding, vocabsz, d_model, pad_id)
+    head_tied  = TiedLayerSpec("tok_embed", torch.nn.Linear,    d_model, vocabsz, bias=False)
 
     layers = []
-    layers.append(TiedLayerSpec("tok_embed", qwen3_model.model.embed_tokens, qwen3_model.model.vocab_size, d_model, args.seq_len))
+    layers.append(embed_tied)                                   # ① 嵌入在最前
     for lid in range(n_layer):
-        layers.append(LayerSpec(Qwen3DecoderLayerPipe, decoder_layers[lid], lid))
-    head = LayerSpec(LMHead, d_model, vocab)
-    layers.append(head)
+        layers.append(LayerSpec(Qwen3DecoderLayerPipe, cfg, lid))
+    layers.append(LayerSpec(Qwen3OutputPipe, d_model, vocabsz))      # ② 尾部 Norm→Head（head 会被拷权）
 
-    
-
-
-
-
-    # loss_fn applied in the end
-    def loss_fn(outputs, labels):
-        # outputs: [B,T,V], labels: [B,T]
-        logits = outputs
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=0)
-        return loss
+    # 简单 CE（Pipeline 会把 labels 送到最后一段的 loss_fn）
+    def loss_fn(logits, labels):
+        return F.cross_entropy(logits.view(-1, vocabsz), labels.view(-1), ignore_index=pad_id)
 
     pipe = PipelineModule(
         layers=layers,
         num_stages=2,
         loss_fn=loss_fn,
-        partition_method="parameters",          # 均分参数量到两个 stage
-        activation_checkpoint_interval=0        # 先关闭重算（可改为 >0 开启）
+        partition_method="parameters",  # 或 "uniform"；DeepSpeed 目前没有稳定的“逐层手工分配”API
+        activation_checkpoint_interval=0
     )
 
-    # 绑定 LMHead 的权重共享（与 tok embedding）
-    # 注意：DeepSpeed 的 TiedLayerSpec 会在构建时绑定相同名字的参数
-    return pipe
+    return pipe, qwen3
 
 
 def main():

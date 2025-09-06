@@ -20,89 +20,64 @@ class Qwen3InputPipe(nn.Module):
       - (optional) turn attention_mask into HF 的 causal_mask_mapping(dict)
     put all the control params into dict, use _normalize_tuple to make kwargs perfect forwarding
     """
-    def __init__(self,
-                 config,
-                 tied_embed: nn.Embedding,
-                 rotary_emb_module,       # passin qwen3_model.model.rotary_emb
-                 has_sliding_layers: bool = False,
-                 build_mask: bool = True):     # wether turn mask into mapping(dict)
+    def __init__(self, config, vocab_size: int, d_model: int, pad_id: int,
+                 has_sliding_layers: bool = False, build_mask: bool = True, rope_eps: float = 1e-6):
         super().__init__()
         self.config = config
-        self.embed_tokens = tied_embed
-        self.rotary_emb = rotary_emb_module
+        self.embed_tokens = nn.Embedding(vocab_size, d_model, padding_idx=pad_id)
+        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.has_sliding_layers = has_sliding_layers
         self.build_mask = build_mask
 
     def forward(self, batch: dict):
-        # === 1) process：input_ids / inputs_embeds  ===
-        input_ids      = batch.get("input_ids", None)
-        inputs_embeds  = batch.get("inputs_embeds", None)
+        # 1) input_ids / inputs_embeds
+        input_ids     = batch.get("input_ids", None)
+        inputs_embeds = batch.get("inputs_embeds", None)
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        # === 2) cache / position related ===
+        # 2) cache / pos
         use_cache       = bool(batch.get("use_cache", False))
         past_key_values = batch.get("past_key_values", None)
-
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
         cache_position = batch.get("cache_position", None)
         if cache_position is None:
             past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
-            # [S] on device
-            cache_position = torch.arange(
-                past_seen, past_seen + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
+            cache_position = torch.arange(past_seen, past_seen + inputs_embeds.shape[1], device=inputs_embeds.device)
 
         position_ids = batch.get("position_ids", None)
         if position_ids is None:
-            # [1, S]
             position_ids = cache_position.unsqueeze(0)
 
-        # === 3) attention mask ===
+        # 3) attention mask -> mapping(dict)
         attention_mask = batch.get("attention_mask", None)
-
-        # if there is no dict（mapping, create one
         causal_mask_mapping = attention_mask
         if self.build_mask and not isinstance(attention_mask, dict):
-            if create_causal_mask is None:
-                # pass down as it was
-                causal_mask_mapping = attention_mask
-            else:
-                mask_kwargs = dict(
-                    config=self.config,
-                    input_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    cache_position=cache_position,
-                    past_key_values=past_key_values,
-                    position_ids=position_ids,
-                )
-                causal_mask_mapping = {
-                    "full_attention": create_causal_mask(**mask_kwargs),
-                }
-                if self.has_sliding_layers and create_sliding_window_causal_mask is not None:
-                    causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+            mask_kwargs = dict(
+                config=self.config, input_embeds=inputs_embeds, attention_mask=attention_mask,
+                cache_position=cache_position, past_key_values=past_key_values, position_ids=position_ids
+            )
+            causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
+            if self.has_sliding_layers and create_sliding_window_causal_mask is not None:
+                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
-        # === 4) calculate RoPE  position_embeddings（ ===
+        # 4) RoPE
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
 
-        # === 5) create perfect forwarding dict ===
-        x = dict(batch)  # shallow copy batch
+        # 5) pack
+        x = dict(batch)  # shallow copy
         x.update({
-            "hidden_states": inputs_embeds,          # requried 
-            "attention_mask": causal_mask_mapping,   # dict（mapping）or mask tensor
+            "hidden_states": inputs_embeds,
+            "attention_mask": causal_mask_mapping,
             "position_ids": position_ids,
             "past_key_values": past_key_values,
             "use_cache": use_cache,
             "cache_position": cache_position,
-            "position_embeddings": position_embeddings,  # passdow to all the layers
+            "position_embeddings": position_embeddings,
         })
-        # clear raw inputs
-        x.pop("input_ids", None)
-        x.pop("inputs_embeds", None)
-
+        x.pop("input_ids", None); x.pop("inputs_embeds", None)
         return x
