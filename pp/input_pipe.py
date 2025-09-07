@@ -6,6 +6,7 @@ from transformers.cache_utils import DynamicCache
 from transformers.models.qwen3.modeling_qwen3 import (
     create_causal_mask,
     create_sliding_window_causal_mask,
+    Qwen3RotaryEmbedding,
 )
 
 
@@ -80,4 +81,14 @@ class Qwen3InputPipe(nn.Module):
             "position_embeddings": position_embeddings,
         })
         x.pop("input_ids", None); x.pop("inputs_embeds", None)
-        return x
+        # DeepSpeed pipeline prefers tuples for tensor routing efficiency
+        return (
+            x["hidden_states"],
+            x["attention_mask"],
+            x["position_ids"],
+            x["past_key_values"],
+            x["use_cache"],
+            x["cache_position"],
+            x["position_embeddings"],
+            {},
+        )

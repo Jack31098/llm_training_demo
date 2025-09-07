@@ -1,9 +1,10 @@
-import math, os, argparse, torch, torch.nn as nn, torch.nn.functional as F
+import math, os, argparse, json, torch, torch.nn as nn, torch.nn.functional as F
 import deepspeed
 import torch
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 from torch.utils.data import Dataset, DataLoader
-from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3DecoderLayer
 from input_pipe import Qwen3InputPipe
 
 
@@ -40,8 +41,10 @@ class Qwen3DecoderLayerPipe(nn.Module):
         # tuple structure convention: hidden_states, attention_mask are required, others are optional 
         # (hidden_states, attention_mask, position_ids, past_key_values, use_cache, cache_position, position_embeddings, kw)
         hs, am, pid, pkv, use_cache, cp, pos_emb, kw = _normalize_tuple(x)
+        # select per-layer mask for computation; keep original mapping for downstream layers
+        am_for_layer = am.get(self.block.attention_type, None) if isinstance(am, dict) else am
         hs = self.block(
-            hidden_states=hs, attention_mask=am, position_ids=pid,
+            hidden_states=hs, attention_mask=am_for_layer, position_ids=pid,
             past_key_values=pkv, use_cache=bool(use_cache),
             cache_position=cp, position_embeddings=pos_emb, **kw
         )
@@ -137,7 +140,7 @@ def build_pipeline_and_ref(model_name_or_path: str, dtype: torch.dtype):
         layers=layers,
         num_stages=2,                      # hardcoded two stages
         partition_method="uniform",        # simple: split by layer number
-        loss_fn=loss_fn=lambda logits, labels: pp_safe_ce_loss(logits, labels, ignore_index=-100, label_smoothing=0.0),
+        loss_fn=lambda logits, labels: pp_safe_ce_loss(logits, labels, ignore_index=-100, label_smoothing=0.0),
         activation_checkpoint_interval=0
     )
     return pipe, ref
@@ -182,77 +185,89 @@ def copy_qwen3_weights_to_pipe(engine, ref):
 
     # stage1：Norm → lm_head（用“值拷贝”，不做指针 tying）
     if engine.is_last_stage():
-        # NormPipe
-        np = next((m for m in pipe.modules() if isinstance(m, NormPipe)), None)
-        if np is not None:
-            _copy(np.norm.weight, "model.norm.weight")
-        # last layer linear layer as lm_head
-        head = next((m for m in pipe.modules()
-                     if isinstance(m, nn.Linear)
-                     and m.in_features == ref.config.hidden_size
-                     and m.out_features == ref.config.vocab_size), None)
-        if head is not None:
-            # directly copy lm_head；if the model binds head to embed, the values are already the same
-            ok = _copy(head.weight, "lm_head.weight")
-            if not ok:  # fallback: use embed weights
-                _copy(head.weight, "model.embed_tokens.weight")
+        tail = next((m for m in pipe.modules() if isinstance(m, Qwen3OutputPipe)), None)
+        if tail is not None:
+            _copy(tail.norm.weight, "model.norm.weight")
+            ok = _copy(tail.head.weight, "lm_head.weight")
+            if not ok:  # 兜底：某些权重 tying 的模型
+                _copy(tail.head.weight, "model.embed_tokens.weight")
+
+
+class JsonlCausalDataset(Dataset):
+    """最简单的数据集：读取 JSONL，每行含 {input: "...", target: "..."}，拼成 input_ids / labels"""
+    def __init__(self, path, tokenizer, input_key="input", target_key="target", seq_len=1024):
+        self.items = [json.loads(l) for l in open(path, "r", encoding="utf-8")]
+        self.tok = tokenizer
+        self.ikey, self.tkey = input_key, target_key
+        self.S = seq_len
+        self.pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
+    def __len__(self): return len(self.items)
+
+    def __getitem__(self, idx):
+        ex = self.items[idx]
+        text = str(ex[self.ikey]) + str(ex[self.tkey])
+        ids  = self.tok(text, truncation=True, max_length=self.S, padding="max_length", return_tensors="pt").input_ids[0]
+        # 右移标签：预测下一个 token；第一个位置无标签置 -100
+        labels = ids.clone()
+        labels[:-1] = ids[1:]
+        labels[-1]  = -100
+        am = (ids != self.pad_id).long()
+        return {"input_ids": ids, "attention_mask": am}, labels
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--deepspeed_config", type=str, default="ds_pp_2gpus.json")
-    p.add_argument("--model_name_or_path", type=str, required=True)
-    p.add_argument("--train_json", type=str, required=True)
-    p.add_argument("--input_key", type=str, default="input")
-    p.add_argument("--target_key", type=str, default="target")
-    # training
-    p.add_argument("--seq_len", type=int, default=1024)
-    prec = p.add_mutually_exclusive_group()
-    prec.add_argument("--bf16", action="store_true", help="Enable bfloat16 training")
-    prec.add_argument("--fp16", action="store_true", help="Enable float16 training")
-    p.add_argument("--use_activation_checkpointing", action="store_true")
-    p.add_argument("--pack_sequences", action="store_false")
-    p.add_argument("--micro_batch_size", type=int, default=1)
-    p.add_argument("--grad_accum_steps", type=int, default=1)
-    p.add_argument("--lr", type=float, default=1e-5)
-    p.add_argument("--wd", type=float, default=0.1)
-    p.add_argument("--max_grad_norm", type=float, default=0.1)
-    p.add_argument("--max_steps", type=int, default=100)
-    # debugging/toggles
-    p.add_argument("--debug_autograd", action="store_true", help="Enable autograd anomaly detection (slow)")
-    p.add_argument("--sanitize_grads", action="store_true", help="Replace NaN/Inf grads with 0 and clamp gradients")
-    p.add_argument("--attn_impl", type=str, default="sdpa", choices=["eager", "sdpa"], help="Attention implementation")
-    p.add_argument("--debug_nan", action="store_true", help="Enable per-layer forward NaN/Inf detection on rank0")
-    # logging / io
-    p.add_argument("--log_every", type=int, default=20)
-    p.add_argument("--debug_per_sample_loss", action="store_true")
-    p.add_argument("--debug_every", type=int, default=100)
-    p.add_argument("--save_ckpt_every", type=int, default=0)
-    p.add_argument("--output_dir", type=str, default="runs/demo")
-    p.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--model_name_or_path", type=str, required=True)
+    parser.add_argument("--train_json", type=str, required=True)
+    parser.add_argument("--input_key", type=str, default="input")
+    parser.add_argument("--target_key", type=str, default="target")
+    parser.add_argument("--seq_len", type=int, default=1024)
+    prec = parser.add_mutually_exclusive_group()
+    prec.add_argument("--bf16", action="store_true")
+    prec.add_argument("--fp16", action="store_true")
+    parser.add_argument("--micro_batch_size", type=int, default=1)
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--log_every", type=int, default=20)
     args = parser.parse_args()
 
     torch.manual_seed(42)
+    dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
-    model = build_pipeline(args.vocab, args.d_model, args.n_head, args.n_layer, args.seq_len)
+    # 1) 只加载一次 HF 模型 + 构建 2-stage Pipeline
+    pipe, ref = build_pipeline_and_ref(args.model_name_or_path, dtype)
 
+    # 2) 初始化 DeepSpeed（注意：这里传的 config 是 JSON 路径或 dict，按你环境来）
     engine, _, _, _ = deepspeed.initialize(
-        model=model,
-        model_parameters=[p for p in model.parameters() if p.requires_grad],
-        config=args.deepspeed_config
+        model=pipe,
+        model_parameters=[p for p in pipe.parameters() if p.requires_grad],
+        config=args.deepspeed_config,
     )
 
-    # simple data iteration (DeepSpeed Pipeline directly feeds (input, labels))
-    dataset = ToyDataset(args.samples, args.seq_len, args.vocab)
-    loader = DataLoader(dataset, batch_size=engine.train_micro_batch_size_per_gpu(), shuffle=True, drop_last=True)
+    # 3) **就是这里**：把这一次加载的权重拷到当前 rank 的子网
+    copy_qwen3_weights_to_pipe(engine, ref)
+    del ref  # 需要的话释放内存
 
-    for epoch in range(args.epochs):
-        for it, (x, y) in enumerate(loader):
-            # DeepSpeed Pipeline 的输入是 tuple；引擎负责把 labels 送到最后一段
-            loss = engine.train_batch(data=(x, y))
-            if engine.is_gradient_accumulation_boundary():
-                if engine.global_rank == 0:
-                    print(f"epoch {epoch} iter {it} loss {loss.item():.4f}")
+    # 4) 数据
+    #    - Pipeline 的第一个 stage 期望拿到 dict（input_ids/attention_mask 等），
+    #    - 最后一段会拿到 labels（engine.train_batch(data=(batch_dict, labels))）
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
+    ds  = JsonlCausalDataset(args.train_json, tok, args.input_key, args.target_key, args.seq_len)
+    # ds = JsonlSFTDataset(args.train_json, input_key=args.input_key, target_key=args.target_key)
+    dl  = DataLoader(ds, batch_size=engine.train_micro_batch_size_per_gpu(), shuffle=True, drop_last=True)
+
+    # 5) 训练循环
+    step = 0
+    for _ in range(args.epochs):
+        for batch_dict, labels in dl:
+            loss = engine.train_batch(data=(batch_dict, labels))
+            step += 1
+            if engine.is_gradient_accumulation_boundary() and engine.global_rank == 0 and (step % args.log_every == 0):
+                print(f"step {step}  loss {loss.item():.4f}")
+
 
 if __name__ == "__main__":
     os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
