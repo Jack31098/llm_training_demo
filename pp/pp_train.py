@@ -116,7 +116,7 @@ def dbg_full_model_safe_ce_loss(model, input_ids, attention_mask, labels, log_ev
 def build_pipeline_and_ref(model_name_or_path: str, dtype: torch.dtype):
     # —— only load once ——（get config and state_dict）
     ref = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path, torch_dtype=dtype, device_map="cpu", low_cpu_mem_usage=True
+        model_name_or_path, dtype=dtype, device_map="cpu", low_cpu_mem_usage=True
     )
     tok = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
@@ -224,6 +224,8 @@ def main():
     parser.add_argument("--input_key", type=str, default="input")
     parser.add_argument("--target_key", type=str, default="target")
     parser.add_argument("--seq_len", type=int, default=1024)
+    # Added to be compatible with DeepSpeed launcher
+    parser.add_argument("--local_rank", type=int, default=-1)
     prec = parser.add_mutually_exclusive_group()
     prec.add_argument("--bf16", action="store_true")
     prec.add_argument("--fp16", action="store_true")
@@ -234,6 +236,7 @@ def main():
     args = parser.parse_args()
 
     torch.manual_seed(42)
+    local_rank = args.local_rank
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
     # 1) 只加载一次 HF 模型 + 构建 2-stage Pipeline
