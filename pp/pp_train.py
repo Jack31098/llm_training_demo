@@ -1,4 +1,4 @@
-import math, os, argparse, json, torch, torch.nn as nn, torch.nn.functional as F
+import math, os, argparse, json, time, torch, torch.nn as nn, torch.nn.functional as F
 import deepspeed
 import torch
 import torch.distributed as dist
@@ -143,28 +143,24 @@ def dbg_full_model_safe_ce_loss(model, input_ids, attention_mask, labels, log_ev
     return pp_safe_ce_loss(logits, labels, ignore_index=-100, label_smoothing=0.0)
 
 
-def make_debug_loss_fn(log_every: int = 20, print_logits_stats: bool = False):
+def make_debug_loss_fn(log_every: int = 1, print_logits_stats: bool = False):
     """Create a loss_fn compatible with PipelineModule that prints microbatch loss.
 
     Prints every `log_every` invocations on rank 0. Optionally prints logits stats.
     """
-    counter = {"i": 0}
-
     def _loss_fn(logits: torch.Tensor, labels: torch.Tensor):
         loss = pp_safe_ce_loss(logits, labels, ignore_index=-100, label_smoothing=0.0)
         try:
-            counter["i"] += 1
-            if log_every and counter["i"] % int(log_every) == 0:
-                if print_logits_stats:
-                    lt = logits.detach()
-                    print({
-                        "train/mb_loss": float(loss.detach().item()),
-                        "logits_mean": float(lt.mean().item()),
-                        "logits_min": float(lt.amin().item()),
-                        "logits_max": float(lt.amax().item()),
-                    }, flush=True)
-                else:
-                    print({"train/mb_loss": float(loss.detach().item())}, flush=True)
+            if print_logits_stats:
+                lt = logits.detach()
+                print({
+                    "train/mb_loss": float(loss.detach().item()),
+                    "logits_mean": float(lt.mean().item()),
+                    "logits_min": float(lt.amin().item()),
+                    "logits_max": float(lt.amax().item()),
+                }, flush=True)
+            else:
+                print({"train/mb_loss": float(loss.detach().item())}, flush=True)
         except Exception:
             pass
         return loss
@@ -351,10 +347,36 @@ def main():
     for _ in range(args.epochs):
         steps_this_epoch = len(ds)
         for _ in range(steps_this_epoch):
+            t0 = time.time()
             loss = engine.train_batch()
+            dt = time.time() - t0
             step += 1
             if engine.is_gradient_accumulation_boundary() and engine.global_rank == 0 and (step % args.log_every == 0):
-                print(f"step {step}  loss {loss.item():.4f}")
+                tokens = engine.train_batch_size() * args.seq_len
+                tps = (tokens / dt) if dt > 0 else 0.0
+                try:
+                    peak_mem_gb = (torch.cuda.max_memory_allocated() / (1024 ** 3)) if torch.cuda.is_available() else 0.0
+                except Exception:
+                    peak_mem_gb = 0.0
+                log = {
+                    "step": step,
+                    "loss": round(float(loss.item()), 6),
+                    "tokens": int(tokens),
+                    "tokens_per_s": round(float(tps), 2),
+                    "step_time_ms": int(dt * 1000),
+                    "peak_mem_gb": round(float(peak_mem_gb), 2),
+                    "dataloader_idle_pct": None,
+                    "pack": False,
+                    "seq_len": args.seq_len,
+                    "micro_batch_size": args.micro_batch_size,
+                    "grad_accum_steps": args.grad_accum_steps,
+                }
+                print(log, flush=True)
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.reset_peak_memory_stats()
+                    except Exception:
+                        pass
 
 
 if __name__ == "__main__":

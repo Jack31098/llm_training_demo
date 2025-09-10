@@ -13,10 +13,10 @@ deepspeed --num_gpus=2 pp/pp_train.py \
   --train_json data/sft_en.jsonl \
   --seq_len 512 \
   --bf16 \
-  --micro_batch_size 1 \
-  --grad_accum_steps 1 \
+  --micro_batch_size 4 \
+  --grad_accum_steps 4 \
   --epochs 1 \
-  --log_every 8 \
+  --log_every 16 \
   --deepspeed_config pp/ds_pp_2gpus.json
 
 
