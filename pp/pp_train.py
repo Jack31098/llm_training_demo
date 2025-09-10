@@ -143,6 +143,34 @@ def dbg_full_model_safe_ce_loss(model, input_ids, attention_mask, labels, log_ev
     return pp_safe_ce_loss(logits, labels, ignore_index=-100, label_smoothing=0.0)
 
 
+def make_debug_loss_fn(log_every: int = 20, print_logits_stats: bool = False):
+    """Create a loss_fn compatible with PipelineModule that prints microbatch loss.
+
+    Prints every `log_every` invocations on rank 0. Optionally prints logits stats.
+    """
+    counter = {"i": 0}
+
+    def _loss_fn(logits: torch.Tensor, labels: torch.Tensor):
+        loss = pp_safe_ce_loss(logits, labels, ignore_index=-100, label_smoothing=0.0)
+        try:
+            counter["i"] += 1
+            if log_every and counter["i"] % int(log_every) == 0:
+                if print_logits_stats:
+                    lt = logits.detach()
+                    print({
+                        "train/mb_loss": float(loss.detach().item()),
+                        "logits_mean": float(lt.mean().item()),
+                        "logits_min": float(lt.amin().item()),
+                        "logits_max": float(lt.amax().item()),
+                    }, flush=True)
+                else:
+                    print({"train/mb_loss": float(loss.detach().item())}, flush=True)
+        except Exception:
+            pass
+        return loss
+
+    return _loss_fn
+
 def build_tokenizer(model_name_or_path: str):
     """Build a single tokenizer instance and ensure pad_token_id exists.
 
@@ -300,6 +328,8 @@ def main():
     # 1) 构建 tokenizer（一次），并据此构建 2-stage Pipeline
     tokenizer, pad_id = build_tokenizer(args.model_name_or_path)
     pipe, ref = build_pipeline_and_ref(args.model_name_or_path, dtype, pad_id)
+    # Replace loss_fn with a debug-printing variant on demand
+    pipe.loss_fn = make_debug_loss_fn(log_every=args.log_every, print_logits_stats=False)
 
     # 2) 初始化 DeepSpeed，并交给 DeepSpeed 内部去构建分布式 DataLoader（使用同一个 tokenizer）
     ds  = JsonlCausalDataset(args.train_json, tokenizer, args.input_key, args.target_key, args.seq_len)
