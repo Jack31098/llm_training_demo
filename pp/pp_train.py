@@ -1,6 +1,7 @@
 import math, os, argparse, json, torch, torch.nn as nn, torch.nn.functional as F
 import deepspeed
 import torch
+import torch.distributed as dist
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -238,9 +239,12 @@ def main():
     torch.manual_seed(42)
     # Ensure distributed is initialized before constructing PipelineModule
     local_rank = args.local_rank
-    torch.cuda.set_device(local_rank)
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+    # if not dist.is_initialized():
+    #     print(f"Initializing distributed process group with backend nccl on rank {local_rank}")
+    #     dist.init_process_group(backend="nccl")
+    # Initialize DeepSpeed comm backend (required by PipelineModule)
+    deepspeed.init_distributed(dist_backend="nccl")
+    print(f"Distributed process group initialized: {dist.is_initialized()} on rank {local_rank}")
     if torch.cuda.is_available() and local_rank >= 0:
         torch.cuda.set_device(local_rank)
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
@@ -272,7 +276,7 @@ def main():
     step = 0
     for _ in range(args.epochs):
         for batch_dict, labels in dl:
-            loss = engine.train_batch(data=(batch_dict, labels))
+            loss = engine.train_batch(data_iter=iter([(batch_dict, labels)]))
             step += 1
             if engine.is_gradient_accumulation_boundary() and engine.global_rank == 0 and (step % args.log_every == 0):
                 print(f"step {step}  loss {loss.item():.4f}")
