@@ -5,7 +5,7 @@ import torch.distributed as dist
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3DecoderLayer
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3DecoderLayer, create_causal_mask, create_sliding_window_causal_mask
 from input_pipe import Qwen3InputPipe
 
 
@@ -36,20 +36,43 @@ class Qwen3DecoderLayerPipe(nn.Module):
     def __init__(self, config, layer_idx: int):
         super().__init__()
         self.block = Qwen3DecoderLayer(config, layer_idx)
+        self.config = config
         self.layer_idx = layer_idx
 
     def forward(self, x):
-        # tuple structure convention: hidden_states, attention_mask are required, others are optional 
-        # (hidden_states, attention_mask, position_ids, past_key_values, use_cache, cache_position, position_embeddings, kw)
-        hs, am, pid, pkv, use_cache, cp, pos_emb, kw = _normalize_tuple(x)
-        # select per-layer mask for computation; keep original mapping for downstream layers
-        am_for_layer = am.get(self.block.attention_type, None) if isinstance(am, dict) else am
+        # 8-slot tensors-only convention for perfect forwarding compatibility
+        # (hidden_states, padding_mask, position_ids, pkv_flag, use_cache_flag, cache_position, pos_emb_pl, kw_pl)
+        hs, pad_mask, pid, pkv_flag, use_cache_flag, cp, pos_emb, _kw_pl = _normalize_tuple(x)
+
+        # Recompute per-layer attention mask and RoPE to avoid sending complex objects
+        am_for_layer = None
+        if pad_mask is not None and pid is not None and cp is not None:
+            mask_kwargs = dict(
+                config=self.config,
+                input_embeds=hs,
+                attention_mask=pad_mask,
+                cache_position=cp,
+                past_key_values=None,
+                position_ids=pid,
+            )
+            if getattr(self.block, 'attention_type', 'full_attention') == 'sliding_attention' and create_sliding_window_causal_mask is not None:
+                am_for_layer = create_sliding_window_causal_mask(**mask_kwargs)
+            else:
+                am_for_layer = create_causal_mask(**mask_kwargs)
+
+        # Recompute RoPE embeddings per layer input size
+        # Note: Qwen3DecoderLayer expects position_embeddings as argument name
+        # import pdb; pdb.set_trace()
         hs = self.block(
-            hidden_states=hs, attention_mask=am_for_layer, position_ids=pid,
-            past_key_values=pkv, use_cache=bool(use_cache),
-            cache_position=cp, position_embeddings=pos_emb, **kw
+            hidden_states=hs,
+            attention_mask=am_for_layer,
+            position_ids=pid,
+            past_key_values=None,
+            use_cache=False,
+            cache_position=cp,
+            position_embeddings=pos_emb,
         )
-        return (hs, am, pid, pkv, use_cache, cp, pos_emb, kw)
+        return (hs, pad_mask, pid, pkv_flag, use_cache_flag, cp, pos_emb, _kw_pl)
 
 def pp_safe_ce_loss(
     logits: torch.Tensor,          # [B, S, V] —— last stage output
@@ -114,13 +137,31 @@ def dbg_full_model_safe_ce_loss(model, input_ids, attention_mask, labels, log_ev
     return pp_safe_ce_loss(logits, labels, ignore_index=-100, label_smoothing=0.0)
 
 
-def build_pipeline_and_ref(model_name_or_path: str, dtype: torch.dtype):
+def build_tokenizer(model_name_or_path: str):
+    """Build a single tokenizer instance and ensure pad_token_id exists.
+
+    Returns
+    -------
+    tokenizer : PreTrainedTokenizerBase
+    pad_id    : int
+    """
+    tok = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
+    # Ensure pad token exists for causal LMs (many don't set it by default)
+    if tok.pad_token_id is None:
+        if tok.eos_token is not None:
+            tok.pad_token = tok.eos_token
+        else:
+            # Fallback: add a PAD token if tokenizer truly lacks eos (rare)
+            tok.add_special_tokens({"pad_token": "<|pad|>"})
+    pad_id = tok.pad_token_id
+    return tok, pad_id
+
+
+def build_pipeline_and_ref(model_name_or_path: str, dtype: torch.dtype, pad_id: int):
     # —— only load once ——（get config and state_dict）
     ref = AutoModelForCausalLM.from_pretrained(
         model_name_or_path, dtype=dtype, device_map="cpu", low_cpu_mem_usage=True
     )
-    tok = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
-    pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
 
     cfg      = ref.config
     n_layer  = cfg.num_hidden_layers
@@ -208,13 +249,14 @@ class JsonlCausalDataset(Dataset):
     def __getitem__(self, idx):
         ex = self.items[idx]
         text = str(ex[self.ikey]) + str(ex[self.tkey])
-        ids  = self.tok(text, truncation=True, max_length=self.S, padding="max_length", return_tensors="pt").input_ids[0]
-        # 右移标签：预测下一个 token；第一个位置无标签置 -100
+        out = self.tok(text, truncation=True, max_length=self.S, padding="max_length", return_tensors="pt")
+        ids  = out.input_ids[0]
+        am   = (ids != self.pad_id).long()
+        # 标签与输入对齐；仅将 PAD 位置置为 -100，具体 shift-right 在 loss 内部完成
         labels = ids.clone()
-        labels[:-1] = ids[1:]
-        labels[-1]  = -100
-        am = (ids != self.pad_id).long()
-        return {"input_ids": ids, "attention_mask": am}, labels
+        labels[ids == self.pad_id] = -100
+        # Return DS pipeline-compatible structure: ((input_ids, attention_mask), labels)
+        return (ids, am), labels
 
 
 def main():
@@ -249,34 +291,31 @@ def main():
         torch.cuda.set_device(local_rank)
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
-    # 1) 只加载一次 HF 模型 + 构建 2-stage Pipeline
-    pipe, ref = build_pipeline_and_ref(args.model_name_or_path, dtype)
+    # 1) 构建 tokenizer（一次），并据此构建 2-stage Pipeline
+    tokenizer, pad_id = build_tokenizer(args.model_name_or_path)
+    pipe, ref = build_pipeline_and_ref(args.model_name_or_path, dtype, pad_id)
 
-    # 2) 初始化 DeepSpeed（注意：这里传的 config 是 JSON 路径或 dict，按你环境来）
+    # 2) 初始化 DeepSpeed，并交给 DeepSpeed 内部去构建分布式 DataLoader（使用同一个 tokenizer）
+    ds  = JsonlCausalDataset(args.train_json, tokenizer, args.input_key, args.target_key, args.seq_len)
     engine, _, _, _ = deepspeed.initialize(
         model=pipe,
         model_parameters=[p for p in pipe.parameters() if p.requires_grad],
         config=args.deepspeed_config,
+        training_data=ds,
     )
 
     # 3) **就是这里**：把这一次加载的权重拷到当前 rank 的子网
     copy_qwen3_weights_to_pipe(engine, ref)
     del ref  # 需要的话释放内存
 
-    # 4) 数据
-    #    - Pipeline 的第一个 stage 期望拿到 dict（input_ids/attention_mask 等），
-    #    - 最后一段会拿到 labels（engine.train_batch(data=(batch_dict, labels))）
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
-    ds  = JsonlCausalDataset(args.train_json, tok, args.input_key, args.target_key, args.seq_len)
-    # ds = JsonlSFTDataset(args.train_json, input_key=args.input_key, target_key=args.target_key)
-    dl  = DataLoader(ds, batch_size=engine.train_micro_batch_size_per_gpu(), shuffle=True, drop_last=True)
+    # 4) 数据由 DeepSpeed 内部的 RepeatingLoader/DistributedSampler 驱动
 
     # 5) 训练循环
     step = 0
     for _ in range(args.epochs):
-        for batch_dict, labels in dl:
-            loss = engine.train_batch(data_iter=iter([(batch_dict, labels)]))
+        steps_this_epoch = len(ds)
+        for _ in range(steps_this_epoch):
+            loss = engine.train_batch()
             step += 1
             if engine.is_gradient_accumulation_boundary() and engine.global_rank == 0 and (step % args.log_every == 0):
                 print(f"step {step}  loss {loss.item():.4f}")
