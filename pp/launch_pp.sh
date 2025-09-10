@@ -4,6 +4,7 @@ export CUDA_VISIBLE_DEVICES=0,1
 export MASTER_ADDR=127.0.0.1
 export MASTER_PORT=29500
 export OMP_NUM_THREADS=24
+export QWEN_SDP_FORCE=math
 
 #  --fp16 \
 #  --bf16 \

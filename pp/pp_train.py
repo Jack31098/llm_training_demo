@@ -16,6 +16,7 @@ class Qwen3OutputPipe(nn.Module):
         self.head = nn.Linear(d_model, vocab, bias=False)
 
     def forward(self, x):
+        import pdb; pdb.set_trace()
         hs = x["hidden_states"] if isinstance(x, dict) else (x[0] if isinstance(x, (tuple, list)) else x)
         return self.head(self.norm(hs))  # [B,S,V]
 
