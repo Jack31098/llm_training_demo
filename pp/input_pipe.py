@@ -30,65 +30,44 @@ class Qwen3InputPipe(nn.Module):
         self.has_sliding_layers = has_sliding_layers
         self.build_mask = build_mask
 
-    def forward(self, batch: dict):
+    def forward(self, batch):
+        # DeepSpeed loader feeds (input_ids, attention_mask)
+        tup = list(batch) if isinstance(batch, (tuple, list)) else [batch]
+        input_ids = tup[0] if len(tup) >= 1 else None
+        attention_mask = tup[1] if len(tup) >= 2 else None
+        inputs_embeds = None
+        position_ids = None
+        use_cache_flag = torch.zeros(1, dtype=torch.long, device=input_ids.device if isinstance(input_ids, torch.Tensor) else None)
+        cache_position = None
+
         # 1) input_ids / inputs_embeds
-        input_ids     = batch.get("input_ids", None)
-        inputs_embeds = batch.get("inputs_embeds", None)
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         # 2) cache / pos
-        use_cache       = bool(batch.get("use_cache", False))
-        past_key_values = batch.get("past_key_values", None)
-        if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
-
-        cache_position = batch.get("cache_position", None)
+        # training path: do not transport past_key_values across pipe; represent as flag tensor only
+        past_key_values = None
         if cache_position is None:
             past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(past_seen, past_seen + inputs_embeds.shape[1], device=inputs_embeds.device)
 
-        position_ids = batch.get("position_ids", None)
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        # 3) attention mask -> mapping(dict)
-        attention_mask = batch.get("attention_mask", None)
-        causal_mask_mapping = attention_mask
-        if self.build_mask and not isinstance(attention_mask, dict):
-            mask_kwargs = dict(
-                config=self.config, input_embeds=inputs_embeds, attention_mask=attention_mask,
-                cache_position=cache_position, past_key_values=past_key_values, position_ids=position_ids
-            )
-            causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
-            if self.has_sliding_layers and create_sliding_window_causal_mask is not None:
-                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+        # 3) build nothing non-tensor for cross-stage comm; pass padding mask through, later layers build per-layer masks
 
-        # 4) RoPE
-        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
+        # 4) RoPE is computed inside each decoder layer; avoid transporting floats here
 
-        # 5) pack
-        x = dict(batch)  # shallow copy
-        x.update({
-            "hidden_states": inputs_embeds,
-            "attention_mask": causal_mask_mapping,
-            "position_ids": position_ids,
-            "past_key_values": past_key_values,
-            "use_cache": use_cache,
-            "cache_position": cache_position,
-            "position_embeddings": position_embeddings,
-        })
-        x.pop("input_ids", None); x.pop("inputs_embeds", None)
-        # DeepSpeed pipeline prefers tuples for tensor routing efficiency
+        # 5) pack tensors-only 8-slot tuple for transport compatibility
+        rsvd1 = torch.zeros(1, dtype=torch.int, device=inputs_embeds.device)
+        rsvd2 = torch.zeros(1, dtype=torch.int, device=inputs_embeds.device)
         return (
-            x["hidden_states"],
-            x["attention_mask"],
-            x["position_ids"],
-            x["past_key_values"],
-            x["use_cache"],
-            x["cache_position"],
-            x["position_embeddings"],
-            {},
+            inputs_embeds,      # 0 hidden_states  [B, S, D]
+            attention_mask,     # 1 padding mask   [B, S]
+            position_ids,       # 2 [B, S]
+            cache_position,     # 5 [S]
+            rsvd1,              # 6 reserved tensor
+            rsvd2,              # 7 reserved tensor
         )

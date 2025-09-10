@@ -1,10 +1,12 @@
-import math, os, argparse, json, torch, torch.nn as nn, torch.nn.functional as F
+import math, os, argparse, json, time, torch, torch.nn as nn, torch.nn.functional as F
 import deepspeed
 import torch
+import torch.distributed as dist
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3DecoderLayer
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3DecoderLayer, create_causal_mask, create_sliding_window_causal_mask
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 from input_pipe import Qwen3InputPipe
 
 
@@ -15,13 +17,16 @@ class Qwen3OutputPipe(nn.Module):
         self.head = nn.Linear(d_model, vocab, bias=False)
 
     def forward(self, x):
-        hs = x["hidden_states"] if isinstance(x, dict) else (x[0] if isinstance(x, (tuple, list)) else x)
+        if isinstance(x, (tuple, list)):
+            hs, _pad, _pid, _cp, _r1, _r2 = x
+        else:
+            hs = x
         return self.head(self.norm(hs))  # [B,S,V]
 
 def _normalize_tuple(x):
     # standalize to a tuple of length 8，the last one is a kwargs dict
     if isinstance(x, torch.Tensor):
-        x = (x, None, None, None, False, None, None, {})
+        x = (x, None, None, False, None, None)
     else:
         x = tuple(x)
         if len(x) < 8:
@@ -35,20 +40,44 @@ class Qwen3DecoderLayerPipe(nn.Module):
     def __init__(self, config, layer_idx: int):
         super().__init__()
         self.block = Qwen3DecoderLayer(config, layer_idx)
+        self.config = config
         self.layer_idx = layer_idx
+        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
 
     def forward(self, x):
-        # tuple structure convention: hidden_states, attention_mask are required, others are optional 
-        # (hidden_states, attention_mask, position_ids, past_key_values, use_cache, cache_position, position_embeddings, kw)
-        hs, am, pid, pkv, use_cache, cp, pos_emb, kw = _normalize_tuple(x)
-        # select per-layer mask for computation; keep original mapping for downstream layers
-        am_for_layer = am.get(self.block.attention_type, None) if isinstance(am, dict) else am
+        # 6-slot tensors-only convention (no floats besides hs):
+        # (hidden_states, padding_mask, position_ids, cache_position, r1, r2)
+        assert len(x) == 6
+        hs, pad_mask, pid, cp, _r1, _r2 = x
+
+        # Recompute per-layer attention mask and RoPE to avoid sending complex objects
+        am_for_layer = None
+        if pad_mask is not None and pid is not None and cp is not None:
+            mask_kwargs = dict(
+                config=self.config,
+                input_embeds=hs,
+                attention_mask=pad_mask,
+                cache_position=cp,
+                past_key_values=None,
+                position_ids=pid,
+            )
+            if getattr(self.block, 'attention_type', 'full_attention') == 'sliding_attention' and create_sliding_window_causal_mask is not None:
+                am_for_layer = create_sliding_window_causal_mask(**mask_kwargs)
+            else:
+                am_for_layer = create_causal_mask(**mask_kwargs)
+
+        # Recompute RoPE per layer locally to avoid sending float ancillaries
+        cos, sin = self.rotary_emb(hs, pid)
         hs = self.block(
-            hidden_states=hs, attention_mask=am_for_layer, position_ids=pid,
-            past_key_values=pkv, use_cache=bool(use_cache),
-            cache_position=cp, position_embeddings=pos_emb, **kw
+            hidden_states=hs,
+            attention_mask=am_for_layer,
+            position_ids=pid,
+            past_key_values=None,
+            use_cache=False,
+            cache_position=cp,
+            position_embeddings=(cos, sin) if cos is not None else None,
         )
-        return (hs, am, pid, pkv, use_cache, cp, pos_emb, kw)
+        return (hs, pad_mask, pid, cp, _r1, _r2)
 
 def pp_safe_ce_loss(
     logits: torch.Tensor,          # [B, S, V] —— last stage output
@@ -63,6 +92,7 @@ def pp_safe_ce_loss(
     - compute CE in FP32; clean logits to avoid NaN/Inf propagation
     """
     # ---- 1) clean &提升精度（只在 loss 内部做，计算图仍连通）----
+    # import pdb; pdb.set_trace()
     if not torch.is_floating_point(logits):
         logits = logits.float()
     logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
@@ -113,13 +143,55 @@ def dbg_full_model_safe_ce_loss(model, input_ids, attention_mask, labels, log_ev
     return pp_safe_ce_loss(logits, labels, ignore_index=-100, label_smoothing=0.0)
 
 
-def build_pipeline_and_ref(model_name_or_path: str, dtype: torch.dtype):
+def make_debug_loss_fn(log_every: int = 1, print_logits_stats: bool = False):
+    """Create a loss_fn compatible with PipelineModule that prints microbatch loss.
+
+    Prints every `log_every` invocations on rank 0. Optionally prints logits stats.
+    """
+    def _loss_fn(logits: torch.Tensor, labels: torch.Tensor):
+        loss = pp_safe_ce_loss(logits, labels, ignore_index=-100, label_smoothing=0.0)
+        try:
+            if print_logits_stats:
+                lt = logits.detach()
+                print({
+                    "train/mb_loss": float(loss.detach().item()),
+                    "logits_mean": float(lt.mean().item()),
+                    "logits_min": float(lt.amin().item()),
+                    "logits_max": float(lt.amax().item()),
+                }, flush=True)
+            else:
+                print({"train/mb_loss": float(loss.detach().item())}, flush=True)
+        except Exception:
+            pass
+        return loss
+
+    return _loss_fn
+
+def build_tokenizer(model_name_or_path: str):
+    """Build a single tokenizer instance and ensure pad_token_id exists.
+
+    Returns
+    -------
+    tokenizer : PreTrainedTokenizerBase
+    pad_id    : int
+    """
+    tok = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
+    # Ensure pad token exists for causal LMs (many don't set it by default)
+    if tok.pad_token_id is None:
+        if tok.eos_token is not None:
+            tok.pad_token = tok.eos_token
+        else:
+            # Fallback: add a PAD token if tokenizer truly lacks eos (rare)
+            tok.add_special_tokens({"pad_token": "<|pad|>"})
+    pad_id = tok.pad_token_id
+    return tok, pad_id
+
+
+def build_pipeline_and_ref(model_name_or_path: str, dtype: torch.dtype, pad_id: int):
     # —— only load once ——（get config and state_dict）
     ref = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path, torch_dtype=dtype, device_map="cpu", low_cpu_mem_usage=True
+        model_name_or_path, dtype=dtype, device_map="cpu", low_cpu_mem_usage=True
     )
-    tok = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
-    pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
 
     cfg      = ref.config
     n_layer  = cfg.num_hidden_layers
@@ -207,13 +279,14 @@ class JsonlCausalDataset(Dataset):
     def __getitem__(self, idx):
         ex = self.items[idx]
         text = str(ex[self.ikey]) + str(ex[self.tkey])
-        ids  = self.tok(text, truncation=True, max_length=self.S, padding="max_length", return_tensors="pt").input_ids[0]
-        # 右移标签：预测下一个 token；第一个位置无标签置 -100
+        out = self.tok(text, truncation=True, max_length=self.S, padding="max_length", return_tensors="pt")
+        ids  = out.input_ids[0]
+        am   = (ids != self.pad_id).long()
+        # 标签与输入对齐；仅将 PAD 位置置为 -100，具体 shift-right 在 loss 内部完成
         labels = ids.clone()
-        labels[:-1] = ids[1:]
-        labels[-1]  = -100
-        am = (ids != self.pad_id).long()
-        return {"input_ids": ids, "attention_mask": am}, labels
+        labels[ids == self.pad_id] = -100
+        # Return DS pipeline-compatible structure: ((input_ids, attention_mask), labels)
+        return (ids, am), labels
 
 
 def main():
@@ -224,6 +297,8 @@ def main():
     parser.add_argument("--input_key", type=str, default="input")
     parser.add_argument("--target_key", type=str, default="target")
     parser.add_argument("--seq_len", type=int, default=1024)
+    # Added to be compatible with DeepSpeed launcher
+    parser.add_argument("--local_rank", type=int, default=-1)
     prec = parser.add_mutually_exclusive_group()
     prec.add_argument("--bf16", action="store_true")
     prec.add_argument("--fp16", action="store_true")
@@ -234,39 +309,74 @@ def main():
     args = parser.parse_args()
 
     torch.manual_seed(42)
+    # Ensure distributed is initialized before constructing PipelineModule
+    local_rank = args.local_rank
+    # if not dist.is_initialized():
+    #     print(f"Initializing distributed process group with backend nccl on rank {local_rank}")
+    #     dist.init_process_group(backend="nccl")
+    # Initialize DeepSpeed comm backend (required by PipelineModule)
+    deepspeed.init_distributed(dist_backend="nccl")
+    print(f"Distributed process group initialized: {dist.is_initialized()} on rank {local_rank}")
+    if torch.cuda.is_available() and local_rank >= 0:
+        torch.cuda.set_device(local_rank)
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
-    # 1) 只加载一次 HF 模型 + 构建 2-stage Pipeline
-    pipe, ref = build_pipeline_and_ref(args.model_name_or_path, dtype)
+    # 1) 构建 tokenizer（一次），并据此构建 2-stage Pipeline
+    tokenizer, pad_id = build_tokenizer(args.model_name_or_path)
+    pipe, ref = build_pipeline_and_ref(args.model_name_or_path, dtype, pad_id)
+    # Replace loss_fn with a debug-printing variant on demand
+    pipe.loss_fn = make_debug_loss_fn(log_every=args.log_every, print_logits_stats=False)
 
-    # 2) 初始化 DeepSpeed（注意：这里传的 config 是 JSON 路径或 dict，按你环境来）
+    # 2) 初始化 DeepSpeed，并交给 DeepSpeed 内部去构建分布式 DataLoader（使用同一个 tokenizer）
+    ds  = JsonlCausalDataset(args.train_json, tokenizer, args.input_key, args.target_key, args.seq_len)
     engine, _, _, _ = deepspeed.initialize(
         model=pipe,
         model_parameters=[p for p in pipe.parameters() if p.requires_grad],
         config=args.deepspeed_config,
+        training_data=ds,
     )
 
     # 3) **就是这里**：把这一次加载的权重拷到当前 rank 的子网
     copy_qwen3_weights_to_pipe(engine, ref)
     del ref  # 需要的话释放内存
 
-    # 4) 数据
-    #    - Pipeline 的第一个 stage 期望拿到 dict（input_ids/attention_mask 等），
-    #    - 最后一段会拿到 labels（engine.train_batch(data=(batch_dict, labels))）
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
-    ds  = JsonlCausalDataset(args.train_json, tok, args.input_key, args.target_key, args.seq_len)
-    # ds = JsonlSFTDataset(args.train_json, input_key=args.input_key, target_key=args.target_key)
-    dl  = DataLoader(ds, batch_size=engine.train_micro_batch_size_per_gpu(), shuffle=True, drop_last=True)
+    # 4) 数据由 DeepSpeed 内部的 RepeatingLoader/DistributedSampler 驱动
 
     # 5) 训练循环
     step = 0
     for _ in range(args.epochs):
-        for batch_dict, labels in dl:
-            loss = engine.train_batch(data=(batch_dict, labels))
+        steps_this_epoch = len(ds)
+        for _ in range(steps_this_epoch):
+            t0 = time.time()
+            loss = engine.train_batch()
+            dt = time.time() - t0
             step += 1
             if engine.is_gradient_accumulation_boundary() and engine.global_rank == 0 and (step % args.log_every == 0):
-                print(f"step {step}  loss {loss.item():.4f}")
+                tokens = engine.train_batch_size() * args.seq_len
+                tps = (tokens / dt) if dt > 0 else 0.0
+                try:
+                    peak_mem_gb = (torch.cuda.max_memory_allocated() / (1024 ** 3)) if torch.cuda.is_available() else 0.0
+                except Exception:
+                    peak_mem_gb = 0.0
+                log = {
+                    "step": step,
+                    "loss": round(float(loss.item()), 6),
+                    "tokens": int(tokens),
+                    "tokens_per_s": round(float(tps), 2),
+                    "step_time_ms": int(dt * 1000),
+                    "peak_mem_gb": round(float(peak_mem_gb), 2),
+                    "dataloader_idle_pct": None,
+                    "pack": False,
+                    "seq_len": args.seq_len,
+                    "micro_batch_size": args.micro_batch_size,
+                    "grad_accum_steps": args.grad_accum_steps,
+                }
+                print(log, flush=True)
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.reset_peak_memory_stats()
+                    except Exception:
+                        pass
 
 
 if __name__ == "__main__":
