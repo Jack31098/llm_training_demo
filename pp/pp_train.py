@@ -6,6 +6,7 @@ from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3DecoderLayer, create_causal_mask, create_sliding_window_causal_mask
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 from input_pipe import Qwen3InputPipe
 
 
@@ -16,14 +17,16 @@ class Qwen3OutputPipe(nn.Module):
         self.head = nn.Linear(d_model, vocab, bias=False)
 
     def forward(self, x):
-        import pdb; pdb.set_trace()
-        hs = x["hidden_states"] if isinstance(x, dict) else (x[0] if isinstance(x, (tuple, list)) else x)
+        if isinstance(x, (tuple, list)):
+            hs, _pad, _pid, _cp, _r1, _r2 = x
+        else:
+            hs = x
         return self.head(self.norm(hs))  # [B,S,V]
 
 def _normalize_tuple(x):
     # standalize to a tuple of length 8，the last one is a kwargs dict
     if isinstance(x, torch.Tensor):
-        x = (x, None, None, None, False, None, None, {})
+        x = (x, None, None, False, None, None)
     else:
         x = tuple(x)
         if len(x) < 8:
@@ -39,11 +42,13 @@ class Qwen3DecoderLayerPipe(nn.Module):
         self.block = Qwen3DecoderLayer(config, layer_idx)
         self.config = config
         self.layer_idx = layer_idx
+        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
 
     def forward(self, x):
-        # 8-slot tensors-only convention for perfect forwarding compatibility
-        # (hidden_states, padding_mask, position_ids, pkv_flag, use_cache_flag, cache_position, pos_emb_pl, kw_pl)
-        hs, pad_mask, pid, pkv_flag, use_cache_flag, cp, pos_emb, _kw_pl = _normalize_tuple(x)
+        # 6-slot tensors-only convention (no floats besides hs):
+        # (hidden_states, padding_mask, position_ids, cache_position, r1, r2)
+        assert len(x) == 6
+        hs, pad_mask, pid, cp, _r1, _r2 = x
 
         # Recompute per-layer attention mask and RoPE to avoid sending complex objects
         am_for_layer = None
@@ -61,9 +66,8 @@ class Qwen3DecoderLayerPipe(nn.Module):
             else:
                 am_for_layer = create_causal_mask(**mask_kwargs)
 
-        # Recompute RoPE embeddings per layer input size
-        # Note: Qwen3DecoderLayer expects position_embeddings as argument name
-        # import pdb; pdb.set_trace()
+        # Recompute RoPE per layer locally to avoid sending float ancillaries
+        cos, sin = self.rotary_emb(hs, pid)
         hs = self.block(
             hidden_states=hs,
             attention_mask=am_for_layer,
@@ -71,9 +75,9 @@ class Qwen3DecoderLayerPipe(nn.Module):
             past_key_values=None,
             use_cache=False,
             cache_position=cp,
-            position_embeddings=pos_emb,
+            position_embeddings=(cos, sin) if cos is not None else None,
         )
-        return (hs, pad_mask, pid, pkv_flag, use_cache_flag, cp, pos_emb, _kw_pl)
+        return (hs, pad_mask, pid, cp, _r1, _r2)
 
 def pp_safe_ce_loss(
     logits: torch.Tensor,          # [B, S, V] —— last stage output
@@ -88,6 +92,7 @@ def pp_safe_ce_loss(
     - compute CE in FP32; clean logits to avoid NaN/Inf propagation
     """
     # ---- 1) clean &提升精度（只在 loss 内部做，计算图仍连通）----
+    # import pdb; pdb.set_trace()
     if not torch.is_floating_point(logits):
         logits = logits.float()
     logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)

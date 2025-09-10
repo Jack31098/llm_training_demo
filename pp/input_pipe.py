@@ -58,21 +58,16 @@ class Qwen3InputPipe(nn.Module):
 
         # 3) build nothing non-tensor for cross-stage comm; pass padding mask through, later layers build per-layer masks
 
-        # 4) RoPE
-        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
-        # import pdb; pdb.set_trace()
+        # 4) RoPE is computed inside each decoder layer; avoid transporting floats here
 
         # 5) pack tensors-only 8-slot tuple for transport compatibility
-        pkv_flag   = torch.zeros(1, dtype=torch.long, device=inputs_embeds.device)
-        pos_emb_pl = torch.zeros(1, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
-        kw_pl      = torch.zeros(1, dtype=torch.long, device=inputs_embeds.device)
+        rsvd1 = torch.zeros(1, dtype=torch.int, device=inputs_embeds.device)
+        rsvd2 = torch.zeros(1, dtype=torch.int, device=inputs_embeds.device)
         return (
             inputs_embeds,      # 0 hidden_states  [B, S, D]
             attention_mask,     # 1 padding mask   [B, S]
             position_ids,       # 2 [B, S]
-            pkv_flag,           # 3 past_kv flag (0: None)
-            use_cache_flag,     # 4 use_cache flag (0/1)
             cache_position,     # 5 [S]
-            position_embeddings,         # 6 placeholder; real RoPE recomputed per layer
-            kw_pl,              # 7 placeholder for kwargs
+            rsvd1,              # 6 reserved tensor
+            rsvd2,              # 7 reserved tensor
         )
