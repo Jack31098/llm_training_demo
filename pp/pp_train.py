@@ -236,7 +236,13 @@ def main():
     args = parser.parse_args()
 
     torch.manual_seed(42)
+    # Ensure distributed is initialized before constructing PipelineModule
     local_rank = args.local_rank
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    if torch.cuda.is_available() and local_rank >= 0:
+        torch.cuda.set_device(local_rank)
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
     # 1) 只加载一次 HF 模型 + 构建 2-stage Pipeline
