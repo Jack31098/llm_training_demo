@@ -18,7 +18,7 @@ class Qwen3OutputPipe(nn.Module):
         self.norm = Qwen3RMSNorm(d_model, eps=eps)
         self.head = nn.Linear(d_model, vocab, bias=False)
         # expose top-level weight for TiedLayerSpec
-        #self.weight = self.head.weight
+        self.weight = self.head.weight
 
     def forward(self, x):
         if isinstance(x, (tuple, list)):
@@ -217,15 +217,15 @@ def build_pipeline_and_ref(model_name_or_path: str, dtype: torch.dtype, pad_id: 
 
     layers = []
     # stage0 entry point: tie token embed with output head via TiedLayerSpec
-    # layers.append(TiedLayerSpec('tok_embed', Qwen3InputPipe, cfg, vocabsz, d_model, pad_id, has_swa, True))
-    layers.append(LayerSpec(Qwen3InputPipe, cfg, vocabsz, d_model, pad_id, has_swa, True))
+    layers.append(TiedLayerSpec('tok_embed', Qwen3InputPipe, cfg, vocabsz, d_model, pad_id, has_swa, True))
+    # layers.append(LayerSpec(Qwen3InputPipe, cfg, vocabsz, d_model, pad_id, has_swa, True))
     
     # intermediate decoder layers
     for lid in range(n_layer):
         layers.append(LayerSpec(Qwen3DecoderLayerPipe, cfg, lid))
     # stage1 tail: Norm → Linear（lm_head），tied with input embedding
-    # layers.append(TiedLayerSpec('tok_embed', Qwen3OutputPipe, d_model, vocabsz))
-    layers.append(LayerSpec(Qwen3OutputPipe, d_model, vocabsz))
+    layers.append(TiedLayerSpec('tok_embed', Qwen3OutputPipe, d_model, vocabsz))
+    # layers.append(LayerSpec(Qwen3OutputPipe, d_model, vocabsz))
 
     pipe = PipelineModule(
         layers=layers,
@@ -235,6 +235,49 @@ def build_pipeline_and_ref(model_name_or_path: str, dtype: torch.dtype, pad_id: 
         activation_checkpoint_interval=0
     )
     return pipe, ref
+
+@torch.no_grad()
+def load_from_ref_into_pipe_before_ds_init(pipe, ref):
+    ref_sd = ref.state_dict()
+
+    def _copy(dst, key):
+        src = ref_sd.get(key, None)
+        if src is None or tuple(src.shape) != tuple(dst.shape):
+            return False
+        dst.copy_(src.to(device=dst.device, dtype=dst.dtype))
+        return True
+
+    # InputPipe：embedding / rotary
+    ip = next((m for m in pipe.modules() if isinstance(m, Qwen3InputPipe)), None)
+    if ip is not None:
+        _copy(ip.embed_tokens.weight, "model.embed_tokens.weight")
+        ip.rotary_emb.load_state_dict(ref.model.rotary_emb.state_dict(), strict=False)
+
+    # Decoder 全层
+    for mod in pipe.modules():
+        if isinstance(mod, Qwen3DecoderLayerPipe):
+            g = int(getattr(mod, "layer_idx"))
+            p = f"model.layers.{g}."
+            blk = mod.block
+            _copy(blk.self_attn.q_proj.weight,         p+"self_attn.q_proj.weight")
+            _copy(blk.self_attn.k_proj.weight,         p+"self_attn.k_proj.weight")
+            _copy(blk.self_attn.v_proj.weight,         p+"self_attn.v_proj.weight")
+            _copy(blk.self_attn.o_proj.weight,         p+"self_attn.o_proj.weight")
+            _copy(blk.self_attn.q_norm.weight,         p+"self_attn.q_norm.weight")
+            _copy(blk.self_attn.k_norm.weight,         p+"self_attn.k_norm.weight")
+            _copy(blk.input_layernorm.weight,          p+"input_layernorm.weight")
+            _copy(blk.post_attention_layernorm.weight, p+"post_attention_layernorm.weight")
+            _copy(blk.mlp.gate_proj.weight,            p+"mlp.gate_proj.weight")
+            _copy(blk.mlp.up_proj.weight,              p+"mlp.up_proj.weight")
+            _copy(blk.mlp.down_proj.weight,            p+"mlp.down_proj.weight")
+
+    # Output：norm + lm_head（这里只对齐一次，不再在 init 之后 copy）
+    tail = next((m for m in pipe.modules() if isinstance(m, Qwen3OutputPipe)), None)
+    if tail is not None:
+        _copy(tail.norm.weight, "model.norm.weight")
+        ok = _copy(tail.head.weight, "lm_head.weight")
+        if not ok:
+            _copy(tail.head.weight, "model.embed_tokens.weight")
 
 @torch.no_grad()
 def copy_qwen3_weights_to_pipe(engine, ref):
@@ -364,16 +407,18 @@ def main():
 
     # 2) 初始化 DeepSpeed，并交给 DeepSpeed 内部去构建分布式 DataLoader（使用同一个 tokenizer）
     ds  = JsonlCausalDataset(args.train_json, tokenizer, args.input_key, args.target_key, args.seq_len)
+    load_from_ref_into_pipe_before_ds_init(pipe, ref)
+    del ref
     engine, _, _, _ = deepspeed.initialize(
         model=pipe,
-        model_parameters=[p for p in pipe.parameters() if p.requires_grad],
+        # model_parameters=[p for p in pipe.parameters() if p.requires_grad],
+        model_parameters=None,
         config=args.deepspeed_config,
         training_data=ds,
     )
 
     # 3) **就是这里**：把这一次加载的权重拷到当前 rank 的子网
-    copy_qwen3_weights_to_pipe(engine, ref)
-    del ref  # 需要的话释放内存
+    # copy_qwen3_weights_to_pipe(engine, ref)
 
     # 4) 数据由 DeepSpeed 内部的 RepeatingLoader/DistributedSampler 驱动
 
