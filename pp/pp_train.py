@@ -1,4 +1,4 @@
-import math, os, argparse, json, time, torch, torch.nn as nn, torch.nn.functional as F
+import sys, math, os, argparse, json, time, torch, torch.nn as nn, torch.nn.functional as F
 import deepspeed
 import torch
 import torch.distributed as dist
@@ -10,11 +10,15 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 from input_pipe import Qwen3InputPipe
 
 
+iter = 0
+
 class Qwen3OutputPipe(nn.Module):
     def __init__(self, d_model: int, vocab: int, eps: float = 1e-6):
         super().__init__()
         self.norm = Qwen3RMSNorm(d_model, eps=eps)
         self.head = nn.Linear(d_model, vocab, bias=False)
+        # expose top-level weight for TiedLayerSpec
+        #self.weight = self.head.weight
 
     def forward(self, x):
         if isinstance(x, (tuple, list)):
@@ -143,24 +147,32 @@ def dbg_full_model_safe_ce_loss(model, input_ids, attention_mask, labels, log_ev
     return pp_safe_ce_loss(logits, labels, ignore_index=-100, label_smoothing=0.0)
 
 
-def make_debug_loss_fn(log_every: int = 1, print_logits_stats: bool = False):
+def make_debug_loss_fn(log_every: int = 1, print_logits_stats: bool = True):
     """Create a loss_fn compatible with PipelineModule that prints microbatch loss.
-
+    
     Prints every `log_every` invocations on rank 0. Optionally prints logits stats.
     """
     def _loss_fn(logits: torch.Tensor, labels: torch.Tensor):
         loss = pp_safe_ce_loss(logits, labels, ignore_index=-100, label_smoothing=0.0)
+        global iter
+        iter += 1
         try:
-            if print_logits_stats:
-                lt = logits.detach()
-                print({
-                    "train/mb_loss": float(loss.detach().item()),
-                    "logits_mean": float(lt.mean().item()),
-                    "logits_min": float(lt.amin().item()),
-                    "logits_max": float(lt.amax().item()),
-                }, flush=True)
-            else:
-                print({"train/mb_loss": float(loss.detach().item())}, flush=True)
+            should_print = (
+                (log_every is not None and log_every > 0 and (iter % log_every == 0))
+                or (iter <= 5)  # always print first few for quick sanity
+            )
+            if should_print:
+                if print_logits_stats:
+                    lt = logits.detach()
+                    print({
+                        "iter": iter,
+                        "train/mb_loss": float(loss.detach().item()),
+                        "logits_mean": float(lt.mean().item()),
+                        "logits_min": float(lt.amin().item()),
+                        "logits_max": float(lt.amax().item()),
+                    }, flush=True)
+                else:
+                    print({"iter": iter, "train/mb_loss": float(loss.detach().item())}, flush=True)
         except Exception:
             pass
         return loss
@@ -192,7 +204,11 @@ def build_pipeline_and_ref(model_name_or_path: str, dtype: torch.dtype, pad_id: 
     ref = AutoModelForCausalLM.from_pretrained(
         model_name_or_path, dtype=dtype, device_map="cpu", low_cpu_mem_usage=True
     )
-
+    tie_word_embeddings = ref.config.tie_word_embeddings
+    # if torch.distributed.get_rank() == 0:
+    #     import pdb; pdb.set_trace()
+    # else:
+    #     time.sleep(1000)
     cfg      = ref.config
     n_layer  = cfg.num_hidden_layers
     d_model  = cfg.hidden_size
@@ -200,12 +216,15 @@ def build_pipeline_and_ref(model_name_or_path: str, dtype: torch.dtype, pad_id: 
     has_swa  = ("sliding_attention" in getattr(cfg, "layer_types", []))
 
     layers = []
-    # stage0 entry point：embed/rope/mask等全部在 InputPipe 里做（后面拷权）
+    # stage0 entry point: tie token embed with output head via TiedLayerSpec
+    # layers.append(TiedLayerSpec('tok_embed', Qwen3InputPipe, cfg, vocabsz, d_model, pad_id, has_swa, True))
     layers.append(LayerSpec(Qwen3InputPipe, cfg, vocabsz, d_model, pad_id, has_swa, True))
+    
     # intermediate decoder layers
     for lid in range(n_layer):
         layers.append(LayerSpec(Qwen3DecoderLayerPipe, cfg, lid))
-    # stage1 tail: Norm → Linear（lm_head），后面用“值拷贝”对齐
+    # stage1 tail: Norm → Linear（lm_head），tied with input embedding
+    # layers.append(TiedLayerSpec('tok_embed', Qwen3OutputPipe, d_model, vocabsz))
     layers.append(LayerSpec(Qwen3OutputPipe, d_model, vocabsz))
 
     pipe = PipelineModule(
@@ -227,13 +246,22 @@ def copy_qwen3_weights_to_pipe(engine, ref):
         src = ref_sd.get(key, None)
         if src is None or tuple(src.shape) != tuple(dst.shape):
             return False
-        dst.copy_(src); return True
+        dst.copy_(src)
+        return True
+        # try:
+        #     # ensure correct device/dtype during copy
+        #     dst.copy_(src.to(device=dst.device, dtype=dst.dtype))
+        #     return True
+        # except Exception:
+        #     # last-resort: move via CPU then to dst
+        #     dst.data = src.detach().to(device=dst.device, dtype=dst.dtype).clone()
+        #     return True
 
     # stage0：InputPipe 的 embedding / rotary
     if engine.is_first_stage():
         ip = next((m for m in pipe.modules() if isinstance(m, Qwen3InputPipe)), None)
         if ip is not None:
-            _copy(ip.embed_tokens.weight, "model.embed_tokens.weight")
+            # _copy(ip.weight, "model.embed_tokens.weight")
             # rotary (mostly buffer)
             ip.rotary_emb.load_state_dict(ref.model.rotary_emb.state_dict(), strict=False)
 
@@ -255,7 +283,7 @@ def copy_qwen3_weights_to_pipe(engine, ref):
             _copy(blk.mlp.up_proj.weight,             pfx+"mlp.up_proj.weight")
             _copy(blk.mlp.down_proj.weight,           pfx+"mlp.down_proj.weight")
 
-    # stage1：Norm → lm_head（用“值拷贝”，不做指针 tying）
+    # stage1：Norm → lm_head（tied with input embedding, copy once is sufficient）
     if engine.is_last_stage():
         tail = next((m for m in pipe.modules() if isinstance(m, Qwen3OutputPipe)), None)
         if tail is not None:
@@ -263,6 +291,13 @@ def copy_qwen3_weights_to_pipe(engine, ref):
             ok = _copy(tail.head.weight, "lm_head.weight")
             if not ok:  # 兜底：某些权重 tying 的模型
                 _copy(tail.head.weight, "model.embed_tokens.weight")
+
+    # After copying, explicitly synchronize tied weights across stages to ensure identical values
+    try:
+        if hasattr(pipe, "_synchronize_tied_weights"):
+            pipe._synchronize_tied_weights()
+    except Exception:
+        sys.exit(1)
 
 
 class JsonlCausalDataset(Dataset):
@@ -325,7 +360,7 @@ def main():
     tokenizer, pad_id = build_tokenizer(args.model_name_or_path)
     pipe, ref = build_pipeline_and_ref(args.model_name_or_path, dtype, pad_id)
     # Replace loss_fn with a debug-printing variant on demand
-    pipe.loss_fn = make_debug_loss_fn(log_every=args.log_every, print_logits_stats=False)
+    pipe.loss_fn = make_debug_loss_fn(log_every=args.log_every, print_logits_stats=True)
 
     # 2) 初始化 DeepSpeed，并交给 DeepSpeed 内部去构建分布式 DataLoader（使用同一个 tokenizer）
     ds  = JsonlCausalDataset(args.train_json, tokenizer, args.input_key, args.target_key, args.seq_len)
@@ -351,16 +386,23 @@ def main():
             loss = engine.train_batch()
             dt = time.time() - t0
             step += 1
-            if engine.is_gradient_accumulation_boundary() and engine.global_rank == 0 and (step % args.log_every == 0):
+            # In pipeline parallelism the loss is only defined on the last stage.
+            # Each call to train_batch() performs one optimizer step (after GAS micro-batches),
+            # so we can log every N steps without checking a transient boundary flag.
+            if engine.is_last_stage() and (step % args.log_every == 0):
                 tokens = engine.train_batch_size() * args.seq_len
                 tps = (tokens / dt) if dt > 0 else 0.0
                 try:
                     peak_mem_gb = (torch.cuda.max_memory_allocated() / (1024 ** 3)) if torch.cuda.is_available() else 0.0
                 except Exception:
                     peak_mem_gb = 0.0
+                try:
+                    loss_value = round(float(loss.item()), 6) if loss is not None else None
+                except Exception:
+                    loss_value = None
                 log = {
                     "step": step,
-                    "loss": round(float(loss.item()), 6),
+                    "loss": loss_value,
                     "tokens": int(tokens),
                     "tokens_per_s": round(float(tps), 2),
                     "step_time_ms": int(dt * 1000),

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
 # reuse the mask function from qwen implementation
@@ -26,6 +27,8 @@ class Qwen3InputPipe(nn.Module):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(vocab_size, d_model, padding_idx=pad_id)
+        # expose top-level weight for TiedLayerSpec
+        # self.weight = self.embed_tokens.weight
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.has_sliding_layers = has_sliding_layers
         self.build_mask = build_mask
@@ -44,7 +47,13 @@ class Qwen3InputPipe(nn.Module):
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
         if inputs_embeds is None:
+            # use tied weight via top-level attribute to ensure tying works even if modules differ
             inputs_embeds = self.embed_tokens(input_ids)
+            # inputs_embeds = F.embedding(
+            #     input_ids,
+            #     self.weight,
+            #     padding_idx=self.embed_tokens.padding_idx,
+            # )
 
         # 2) cache / pos
         # training path: do not transport past_key_values across pipe; represent as flag tensor only
