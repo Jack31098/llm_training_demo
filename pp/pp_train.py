@@ -3,12 +3,13 @@ import deepspeed
 from torch.amp import autocast
 import torch
 import torch.distributed as dist
+import torch.utils.checkpoint as ckpt
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3DecoderLayer, create_causal_mask, create_sliding_window_causal_mask
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
-from input_pipe import Qwen3InputPipe
+from input_pipe import Qwen3InputPipe, _assert_pipe_tuple
 
 
 iter = 0
@@ -37,12 +38,23 @@ class Qwen3DecoderLayerPipe(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
+        self.use_ckpt = True
 
     def forward(self, x):
+        hs, pad_mask, pid, cp, r1, r2 = x
+        # 确保进入 checkpoint 的第一个实参有梯度（hs 是 leaf，允许就地置位）
+        if hs.is_leaf and hs.is_floating_point() and not hs.requires_grad:
+            hs.requires_grad_()
+        if self.use_ckpt:
+            return ckpt.checkpoint(self._forward, x, use_reentrant=False)
+        else:
+            return self._forward(x)
+
+    def _forward(self, x):
         # with autocast("cuda", dtype=torch.bfloat16, enabled=True):
         # 6-slot tensors-only convention (no floats besides hs):
         # (hidden_states, padding_mask, position_ids, cache_position, r1, r2)
-        assert len(x) == 6
+        # _assert_pipe_tuple(x, f"layer{self.layer_idx}.in")
         hs, pad_mask, pid, cp, _r1, _r2 = x
 
         # Recompute per-layer attention mask and RoPE to avoid sending complex objects
@@ -72,7 +84,9 @@ class Qwen3DecoderLayerPipe(nn.Module):
             cache_position=cp,
             position_embeddings=(cos, sin) if cos is not None else None,
         )
-        return (hs, pad_mask, pid, cp, _r1, _r2)
+        ret = (hs, pad_mask, pid, cp, _r1, _r2)
+        # _assert_pipe_tuple(ret, f"layer{self.layer_idx}.out")
+        return ret
 
 def pp_safe_ce_loss(
     logits: torch.Tensor,          # [B, S, V] —— last stage output
@@ -223,7 +237,7 @@ def build_pipeline_and_ref(model_name_or_path: str, dtype: torch.dtype, pad_id: 
         num_stages=2,                      # hardcoded two stages
         partition_method="uniform",        # simple: split by layer number
         loss_fn=lambda logits, labels: pp_safe_ce_loss(logits, labels, ignore_index=-100, label_smoothing=0.0),
-        activation_checkpoint_interval=1
+        activation_checkpoint_interval=0
     )
     return pipe, ref
 

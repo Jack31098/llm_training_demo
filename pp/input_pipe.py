@@ -12,6 +12,13 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 
 
+def _assert_pipe_tuple(x, where=""):
+    assert isinstance(x, (tuple, list)) and len(x) == 6, f"{where}: tuple len!=6"
+    hs, pad, pid, cp, r1, r2 = x
+    assert torch.is_tensor(hs) and hs.requires_grad, f"{where}: x[0] must be Tensor with requires_grad=True"
+    for i, t in enumerate((pad, pid, cp, r1, r2), 1):
+        assert torch.is_tensor(t), f"{where}: x[{i}] must be Tensor"
+
 
 class Qwen3InputPipe(nn.Module):
     """
@@ -30,6 +37,7 @@ class Qwen3InputPipe(nn.Module):
         self.embed_tokens = nn.Embedding(vocab_size, d_model, padding_idx=pad_id)
         # expose top-level weight for TiedLayerSpec
         self.weight = self.embed_tokens.weight
+        # self.dummy_weight = torch.zeros([1,1, d_model], dtype=torch.float, device=self.weight.device, requires_grad=True)
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.has_sliding_layers = has_sliding_layers
         self.build_mask = build_mask
@@ -40,22 +48,21 @@ class Qwen3InputPipe(nn.Module):
         tup = list(batch) if isinstance(batch, (tuple, list)) else [batch]
         input_ids = tup[0] if len(tup) >= 1 else None
         attention_mask = tup[1] if len(tup) >= 2 else None
-        inputs_embeds = None
         position_ids = None
         use_cache_flag = torch.zeros(1, dtype=torch.long, device=input_ids.device if isinstance(input_ids, torch.Tensor) else None)
         cache_position = None
 
         # 1) input_ids / inputs_embeds
-        if (input_ids is None) == (inputs_embeds is None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-        if inputs_embeds is None:
-            # use tied weight via top-level attribute to ensure tying works even if modules differ
-            # inputs_embeds = self.embed_tokens(input_ids)
-            inputs_embeds = F.embedding(
-                input_ids,
-                self.weight,
-                padding_idx=self.embed_tokens.padding_idx,
-            )
+        if input_ids is None:
+            raise ValueError("You must specify input_ids")
+
+        # use tied weight via top-level attribute to ensure tying works even if modules differ
+        # inputs_embeds = self.embed_tokens(input_ids)
+        inputs_embeds = F.embedding(
+            input_ids,
+            self.weight,
+            padding_idx=self.embed_tokens.padding_idx,
+        )
 
         # 2) cache / pos
         # training path: do not transport past_key_values across pipe; represent as flag tensor only
@@ -74,7 +81,8 @@ class Qwen3InputPipe(nn.Module):
         # 5) pack tensors-only 8-slot tuple for transport compatibility
         rsvd1 = torch.zeros(1, dtype=torch.int, device=inputs_embeds.device)
         rsvd2 = torch.zeros(1, dtype=torch.int, device=inputs_embeds.device)
-        return (
+        # inputs_embeds = inputs_embeds + 0.0 * self.dummy_weight.to(inputs_embeds.device)
+        ret = (
             inputs_embeds,      # 0 hidden_states  [B, S, D]
             attention_mask,     # 1 padding mask   [B, S]
             position_ids,       # 2 [B, S]
@@ -82,3 +90,7 @@ class Qwen3InputPipe(nn.Module):
             rsvd1,              # 6 reserved tensor
             rsvd2,              # 7 reserved tensor
         )
+        # if torch.distributed.get_rank() == 0:
+        #     import pdb; pdb.set_trace()
+        # _assert_pipe_tuple(ret,  "input.out")
+        return ret
