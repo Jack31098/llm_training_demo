@@ -1,5 +1,6 @@
 import sys, math, os, argparse, json, time, torch, torch.nn as nn, torch.nn.functional as F
 import deepspeed
+from torch.amp import autocast
 import torch
 import torch.distributed as dist
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
@@ -27,17 +28,6 @@ class Qwen3OutputPipe(nn.Module):
             hs = x
         return self.head(self.norm(hs))  # [B,S,V]
 
-def _normalize_tuple(x):
-    # standalize to a tuple of length 8，the last one is a kwargs dict
-    if isinstance(x, torch.Tensor):
-        x = (x, None, None, False, None, None)
-    else:
-        x = tuple(x)
-        if len(x) < 8:
-            x = (x + (None,)*(8-len(x)))  # padding to length 8
-        if x[7] is None:    # if a kwarg passin, it won't be None
-            x = x[:7] + ({},)
-    return x
 
 class Qwen3DecoderLayerPipe(nn.Module):
     """Wrap Qwen3DecoderLayer to accept/return a tuple for pipeline."""
@@ -49,6 +39,7 @@ class Qwen3DecoderLayerPipe(nn.Module):
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
 
     def forward(self, x):
+        # with autocast("cuda", dtype=torch.bfloat16, enabled=True):
         # 6-slot tensors-only convention (no floats besides hs):
         # (hidden_states, padding_mask, position_ids, cache_position, r1, r2)
         assert len(x) == 6
@@ -165,14 +156,14 @@ def make_debug_loss_fn(log_every: int = 1, print_logits_stats: bool = True):
                 if print_logits_stats:
                     lt = logits.detach()
                     print({
-                        "iter": iter,
+                        "micro_batch_iter": iter,
                         "train/mb_loss": float(loss.detach().item()),
                         "logits_mean": float(lt.mean().item()),
                         "logits_min": float(lt.amin().item()),
                         "logits_max": float(lt.amax().item()),
                     }, flush=True)
                 else:
-                    print({"iter": iter, "train/mb_loss": float(loss.detach().item())}, flush=True)
+                    print({"micro_batch_iter": iter, "train/mb_loss": float(loss.detach().item())}, flush=True)
         except Exception:
             pass
         return loss
@@ -232,7 +223,7 @@ def build_pipeline_and_ref(model_name_or_path: str, dtype: torch.dtype, pad_id: 
         num_stages=2,                      # hardcoded two stages
         partition_method="uniform",        # simple: split by layer number
         loss_fn=lambda logits, labels: pp_safe_ce_loss(logits, labels, ignore_index=-100, label_smoothing=0.0),
-        activation_checkpoint_interval=0
+        activation_checkpoint_interval=1
     )
     return pipe, ref
 
@@ -279,69 +270,6 @@ def load_from_ref_into_pipe_before_ds_init(pipe, ref):
         if not ok:
             _copy(tail.head.weight, "model.embed_tokens.weight")
 
-@torch.no_grad()
-def copy_qwen3_weights_to_pipe(engine, ref):
-    """copy the weights of Qwen3ForCausalLM(ref) to the current rank's Pipeline subnet"""
-    ref_sd = ref.state_dict()
-    pipe   = engine.module
-
-    def _copy(dst, key):
-        src = ref_sd.get(key, None)
-        if src is None or tuple(src.shape) != tuple(dst.shape):
-            return False
-        dst.copy_(src)
-        return True
-        # try:
-        #     # ensure correct device/dtype during copy
-        #     dst.copy_(src.to(device=dst.device, dtype=dst.dtype))
-        #     return True
-        # except Exception:
-        #     # last-resort: move via CPU then to dst
-        #     dst.data = src.detach().to(device=dst.device, dtype=dst.dtype).clone()
-        #     return True
-
-    # stage0：InputPipe 的 embedding / rotary
-    if engine.is_first_stage():
-        ip = next((m for m in pipe.modules() if isinstance(m, Qwen3InputPipe)), None)
-        if ip is not None:
-            # _copy(ip.weight, "model.embed_tokens.weight")
-            # rotary (mostly buffer)
-            ip.rotary_emb.load_state_dict(ref.model.rotary_emb.state_dict(), strict=False)
-
-    # all decoder layers: copy by layer name
-    for mod in pipe.modules():
-        if isinstance(mod, Qwen3DecoderLayerPipe):
-            g   = int(getattr(mod, "layer_idx"))
-            pfx = f"model.layers.{g}."
-            blk = mod.block
-            _copy(blk.self_attn.q_proj.weight,        pfx+"self_attn.q_proj.weight")
-            _copy(blk.self_attn.k_proj.weight,        pfx+"self_attn.k_proj.weight")
-            _copy(blk.self_attn.v_proj.weight,        pfx+"self_attn.v_proj.weight")
-            _copy(blk.self_attn.o_proj.weight,        pfx+"self_attn.o_proj.weight")
-            _copy(blk.self_attn.q_norm.weight,        pfx+"self_attn.q_norm.weight")
-            _copy(blk.self_attn.k_norm.weight,        pfx+"self_attn.k_norm.weight")
-            _copy(blk.input_layernorm.weight,         pfx+"input_layernorm.weight")
-            _copy(blk.post_attention_layernorm.weight,pfx+"post_attention_layernorm.weight")
-            _copy(blk.mlp.gate_proj.weight,           pfx+"mlp.gate_proj.weight")
-            _copy(blk.mlp.up_proj.weight,             pfx+"mlp.up_proj.weight")
-            _copy(blk.mlp.down_proj.weight,           pfx+"mlp.down_proj.weight")
-
-    # stage1：Norm → lm_head（tied with input embedding, copy once is sufficient）
-    if engine.is_last_stage():
-        tail = next((m for m in pipe.modules() if isinstance(m, Qwen3OutputPipe)), None)
-        if tail is not None:
-            _copy(tail.norm.weight, "model.norm.weight")
-            ok = _copy(tail.head.weight, "lm_head.weight")
-            if not ok:  # 兜底：某些权重 tying 的模型
-                _copy(tail.head.weight, "model.embed_tokens.weight")
-
-    # After copying, explicitly synchronize tied weights across stages to ensure identical values
-    try:
-        if hasattr(pipe, "_synchronize_tied_weights"):
-            pipe._synchronize_tied_weights()
-    except Exception:
-        sys.exit(1)
-
 
 class JsonlCausalDataset(Dataset):
     """最简单的数据集：读取 JSONL，每行含 {input: "...", target: "..."}，拼成 input_ids / labels"""
@@ -380,8 +308,6 @@ def main():
     prec = parser.add_mutually_exclusive_group()
     prec.add_argument("--bf16", action="store_true")
     prec.add_argument("--fp16", action="store_true")
-    parser.add_argument("--micro_batch_size", type=int, default=1)
-    parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--log_every", type=int, default=20)
     args = parser.parse_args()
@@ -409,6 +335,11 @@ def main():
     ds  = JsonlCausalDataset(args.train_json, tokenizer, args.input_key, args.target_key, args.seq_len)
     load_from_ref_into_pipe_before_ds_init(pipe, ref)
     del ref
+    # base_opt = torch.optim.AdamW(
+    #     [p for p in pipe.parameters() if p.requires_grad],
+    #     lr=5e-6, betas=(0.9, 0.95), eps=1e-6, weight_decay=0.0
+    # )
+
     engine, _, _, _ = deepspeed.initialize(
         model=pipe,
         # model_parameters=[p for p in pipe.parameters() if p.requires_grad],
@@ -455,8 +386,6 @@ def main():
                     "dataloader_idle_pct": None,
                     "pack": False,
                     "seq_len": args.seq_len,
-                    "micro_batch_size": args.micro_batch_size,
-                    "grad_accum_steps": args.grad_accum_steps,
                 }
                 print(log, flush=True)
                 if torch.cuda.is_available():

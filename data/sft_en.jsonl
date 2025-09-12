@@ -125,3 +125,4 @@
 {"input":"Give one advantage of bfloat16 over float32.","target":"BF16 keeps the same exponent width as FP32, preserving dynamic range, so it usually trains stably without loss scaling while reducing memory and bandwidth."}
 {"input":"Describe the 1F1B pipeline schedule in a sentence.","target":"The 1F1B schedule alternates forward and backward passes of micro-batches across pipeline stages to reduce bubbles and improve hardware utilization."}
 {"input":"When should sequence parallelism be enabled?","target":"Enable SP at longer contexts, typically beyond 2–4k tokens, when activation memory starts to dominate and its communication cost can be amortized."}
+{"input":"what's the difference between adam and adamw?","target":"Adam uses bias correction, while AdamW decouples weight decay from the gradient update, providing true L2 regularization for better generalization."}

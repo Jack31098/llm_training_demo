@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.amp import autocast
 import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
@@ -34,6 +35,7 @@ class Qwen3InputPipe(nn.Module):
         self.build_mask = build_mask
 
     def forward(self, batch):
+        # with autocast("cuda", dtype=torch.bfloat16, enabled=True):
         # DeepSpeed loader feeds (input_ids, attention_mask)
         tup = list(batch) if isinstance(batch, (tuple, list)) else [batch]
         input_ids = tup[0] if len(tup) >= 1 else None
