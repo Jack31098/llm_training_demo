@@ -10,7 +10,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3DecoderLayer, create_causal_mask, create_sliding_window_causal_mask
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 from input_pipe import Qwen3InputPipe, _assert_pipe_tuple
-from torch.profiler import profile, ProfilerActivity, schedule
+# from torch.profiler import profile, ProfilerActivity, schedule
+from profiler import CommTimer, should_enable_timer
 
 
 iter = 0
@@ -326,10 +327,11 @@ def main():
     parser.add_argument("--max_examples", type=int, default=1024,
                         help="stop after this many examples")
     parser.add_argument("--log_every", type=int, default=20)
-    parser.add_argument("--profile_steps", type=int, default=64,
-                        help="when >0, sample to calculate T_comp/T_comm")
-    parser.add_argument("--profile_trace_dir", type=str, default="",
-                        help="optional: write Chrome trace to directory for visualization")
+    parser.add_argument("--timer_steps", type=int, default=32,
+                        help="when > 0, profile to calculate T_comp/T_comm")
+    parser.add_argument("--enable_comm_timer", default=True,
+                        help="enable comm timer to profile T_comm")
+    parser.add_argument("--timer_start_step", type=int, default=0)
     args = parser.parse_args()
 
     torch.manual_seed(42)
@@ -368,50 +370,24 @@ def main():
         training_data=ds,
     )
 
-    # 3) **就是这里**：把这一次加载的权重拷到当前 rank 的子网
-    # copy_qwen3_weights_to_pipe(engine, ref)
+    comm_timer = CommTimer(enable=args.enable_comm_timer)
+    comm_timer.install()
 
-    # 4) 数据由 DeepSpeed 内部的 RepeatingLoader/DistributedSampler 驱动
-
-    def _is_comm_key(name: str) -> bool:
-        n = name.lower()
-        return (
-            "nccl" in n
-            or "all_reduce" in n or "allreduce" in n
-            or "reduce_scatter" in n
-            or "all_gather" in n or "_all_gather_base" in n
-            or "broadcast" in n
-            or ("send" in n and "nccl" in n) or ("recv" in n and "nccl" in n)
-            or ("peer" in n and "copy" in n)  # p2p copy
-        )
-
-    #  sample based profiler（only record args.profile_steps steps）
-    prof = None
-    prof_steps_target = max(0, int(args.profile_steps))
-    prof_steps_done = 0
-    prof_wall_ms = 0.0
-    if prof_steps_target > 0:
-        prof = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=schedule(wait=0, warmup=0, active=prof_steps_target, repeat=1),
-            record_shapes=False, with_stack=False, profile_memory=False,
-        )
-        prof.__enter__()
-
-    # 5) train loop
+    # 3) train loop
     step = 0
     global_bs = engine.train_batch_size()
     total_steps = math.ceil(args.max_examples / global_bs)
     assert args.max_examples > 0, "max_examples must be set"
     for _ in range(total_steps):
+        timers_enabled = args.enable_comm_timer # and should_enable_timer(step + 1, args.timer_start_step, args.timer_steps)
         t0 = time.time()
+        if timers_enabled:
+            print(f"timer begin_step {step}")
+            comm_timer.begin_step()
         loss = engine.train_batch()
         dt = time.time() - t0
         step += 1
-        if prof is not None and prof_steps_done < prof_steps_target:
-            prof_wall_ms += dt * 1000.0
-            prof.step()
-            prof_steps_done += 1
+        
         # In pipeline parallelism the loss is only defined on the last stage.
         # Each call to train_batch() performs one optimizer step (after GAS micro-batches),
         # so we can log every N steps without checking a transient boundary flag.
@@ -443,75 +419,20 @@ def main():
                     torch.cuda.reset_peak_memory_stats()
                 except Exception:
                     pass
-    if prof is not None:
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        ev = prof.key_averages()  # 只统计 active 窗口
-
-        def _cuda_us(e):
-            # 兼容 CUDA/ROCm 和不同版本字段
-            for attr in ("self_cuda_time_total", "cuda_time_total", "self_cuda_time", "device_time"):
-                v = getattr(e, attr, 0.0)
-                if v and float(v) > 0:
-                    return float(v)
-            return 0.0
-
-        def _lname(s): return (s or "").lower()
-
-        # 扩展通信关键字（NCCL/RCCL + c10d）
-        def _is_comm_key(name: str) -> bool:
-            n = _lname(name)
-            return (
-                "nccl" in n or "rccl" in n
-                or "all_reduce" in n or "allreduce" in n
-                or "reduce_scatter" in n or "all_gather" in n or "_all_gather_base" in n
-                or "broadcast" in n
-                or n.startswith("c10d::allreduce_") or n.startswith("c10d::all_gather")
-                or n.startswith("c10d::reduce_scatter") or n.startswith("c10d::broadcast_")
-            )
-
-        # 扩展内存搬运关键字（ROCm 的 hip* 也算）
-        def _is_mem_key(name: str) -> bool:
-            n = _lname(name)
-            return (
-                "memcpy" in n or "memset" in n
-                or "hipmemcpy" in n or "hipmemset" in n
-                or "memcpyasync" in n or "hipmemcpyasync" in n or "hipmemsetasync" in n
-            )
-
-        # 避免把 ProfilerStep* 算进总 CUDA 时间
-        filtered = [e for e in ev if not _lname(e.key).startswith("profilerstep")]
-        cuda_us   = sum(_cuda_us(e) for e in filtered)
-        comm_us   = sum(_cuda_us(e) for e in filtered if _is_comm_key(e.key))
-        memcpy_us = sum(_cuda_us(e) for e in filtered if _is_mem_key(e.key))
-        comp_us = max(0.0, cuda_us - comm_us - memcpy_us)
-
-        # 粗略的“掩盖比例”估计：overlap_ms = max(0, comp+comm - step_wall)
-        # 如果 overlap≈comm，则通信几乎被完全掩盖
-        step_wall_ms = prof_wall_ms
-        sum_ms = (comp_us + comm_us) / 1000.0
-        overlap_ms = max(0.0, sum_ms - step_wall_ms)
-        hidden_ratio = 0.0 if comm_us == 0 else min(1.0, overlap_ms / (comm_us / 1000.0))
-        # if rank == 0:
-        #     import pdb; pdb.set_trace()
-        out = {
-            "rank": rank,
-            "profiled_steps": prof_steps_done,
-            "T_comp_ms": round(comp_us/1000.0, 2),
-            "T_comm_ms": round(comm_us/1000.0, 2),
-            "T_mem_ms": round(memcpy_us/1000.0, 2),
-            "wall_ms": round(step_wall_ms, 2),
-            "est_hidden_comm_ratio": round(hidden_ratio, 3)
-        }
-        print({"profiling": out}, flush=True)
-        torch.distributed.barrier()
-
-        if args.profile_trace_dir:
-            os.makedirs(args.profile_trace_dir, exist_ok=True)
-            prof.export_chrome_trace(os.path.join(args.profile_trace_dir, f"trace_rank{rank}.json"))
-
-        prof.__exit__(None, None, None)
+        if timers_enabled:
+            timing = comm_timer.end_step()
+            # if torch.distributed.get_rank() == 0:
+            #     import pdb; pdb.set_trace()
+            if timing is not None and engine.is_last_stage():
+                print({"profiling_timer": {
+                    "rank": CommTimer.rank(),
+                    "step": step,
+                    "T_step_ms": round(timing.step_ms, 2),
+                    "T_comm_ms": round(timing.comm_ms, 2),
+                    "T_comp_ms": round(timing.comp_ms, 2),
+                    "hidden_ratio_est": round(timing.hidden_ratio_est, 3),
+                }}, flush=True)
+            # torch.distributed.barrier()
 
 def cleanup_dist():
     if dist.is_initialized():
