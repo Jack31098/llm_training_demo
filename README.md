@@ -1,4 +1,4 @@
-### Key Results (Benchmarked with Qwen3 0.6B seq_len=1024, over 32 steps, the readings are avg)
+### Key Results (Benchmarked with Qwen3 0.6B, seq_len=1024, over 32 steps, the readings are avg)
 
 Legend: 
 `step_ms` avg over 32 steps (excl. data); 
