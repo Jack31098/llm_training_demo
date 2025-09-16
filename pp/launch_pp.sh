@@ -15,7 +15,7 @@ deepspeed --num_gpus=2 pp/pp_train.py \
   --seq_len 1024 \
   --bf16 \
   --max_examples 128 \
-  --log_every 32 \
+  --log_every 2 \
   --deepspeed_config pp/ds_pp_2gpus.json
 
 
