@@ -10,6 +10,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3DecoderLayer, create_causal_mask, create_sliding_window_causal_mask
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 from input_pipe import Qwen3InputPipe, _assert_pipe_tuple
+from torch.profiler import profile, ProfilerActivity, schedule
 
 
 iter = 0
@@ -322,8 +323,13 @@ def main():
     prec = parser.add_mutually_exclusive_group()
     prec.add_argument("--bf16", action="store_true")
     prec.add_argument("--fp16", action="store_true")
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--max_examples", type=int, default=1024,
+                        help="stop after this many examples")
     parser.add_argument("--log_every", type=int, default=20)
+    parser.add_argument("--profile_steps", type=int, default=64,
+                        help="when >0, sample to calculate T_comp/T_comm")
+    parser.add_argument("--profile_trace_dir", type=str, default="",
+                        help="optional: write Chrome trace to directory for visualization")
     args = parser.parse_args()
 
     torch.manual_seed(42)
@@ -367,50 +373,160 @@ def main():
 
     # 4) 数据由 DeepSpeed 内部的 RepeatingLoader/DistributedSampler 驱动
 
-    # 5) 训练循环
+    def _is_comm_key(name: str) -> bool:
+        n = name.lower()
+        return (
+            "nccl" in n
+            or "all_reduce" in n or "allreduce" in n
+            or "reduce_scatter" in n
+            or "all_gather" in n or "_all_gather_base" in n
+            or "broadcast" in n
+            or ("send" in n and "nccl" in n) or ("recv" in n and "nccl" in n)
+            or ("peer" in n and "copy" in n)  # p2p copy
+        )
+
+    #  sample based profiler（only record args.profile_steps steps）
+    prof = None
+    prof_steps_target = max(0, int(args.profile_steps))
+    prof_steps_done = 0
+    prof_wall_ms = 0.0
+    if prof_steps_target > 0:
+        prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule(wait=0, warmup=0, active=prof_steps_target, repeat=1),
+            record_shapes=False, with_stack=False, profile_memory=False,
+        )
+        prof.__enter__()
+
+    # 5) train loop
     step = 0
-    for _ in range(args.epochs):
-        steps_this_epoch = len(ds)
-        for _ in range(steps_this_epoch):
-            t0 = time.time()
-            loss = engine.train_batch()
-            dt = time.time() - t0
-            step += 1
-            # In pipeline parallelism the loss is only defined on the last stage.
-            # Each call to train_batch() performs one optimizer step (after GAS micro-batches),
-            # so we can log every N steps without checking a transient boundary flag.
-            if engine.is_last_stage() and (step % args.log_every == 0):
-                tokens = engine.train_batch_size() * args.seq_len
-                tps = (tokens / dt) if dt > 0 else 0.0
+    global_bs = engine.train_batch_size()
+    total_steps = math.ceil(args.max_examples / global_bs)
+    assert args.max_examples > 0, "max_examples must be set"
+    for _ in range(total_steps):
+        t0 = time.time()
+        loss = engine.train_batch()
+        dt = time.time() - t0
+        step += 1
+        if prof is not None and prof_steps_done < prof_steps_target:
+            prof_wall_ms += dt * 1000.0
+            prof.step()
+            prof_steps_done += 1
+        # In pipeline parallelism the loss is only defined on the last stage.
+        # Each call to train_batch() performs one optimizer step (after GAS micro-batches),
+        # so we can log every N steps without checking a transient boundary flag.
+        if engine.is_last_stage() and (step % args.log_every == 0):
+            tokens = engine.train_batch_size() * args.seq_len
+            tps = (tokens / dt) if dt > 0 else 0.0
+            try:
+                peak_mem_gb = (torch.cuda.max_memory_allocated() / (1024 ** 3)) if torch.cuda.is_available() else 0.0
+            except Exception:
+                peak_mem_gb = 0.0
+            try:
+                loss_value = round(float(loss.item()), 6) if loss is not None else None
+            except Exception:
+                loss_value = None
+            log = {
+                "step": step,
+                "loss": loss_value,
+                "tokens": int(tokens),
+                "tokens_per_s": round(float(tps), 2),
+                "step_time_ms": int(dt * 1000),
+                "peak_mem_gb": round(float(peak_mem_gb), 2),
+                "dataloader_idle_pct": None,
+                "pack": False,
+                "seq_len": args.seq_len,
+            }
+            print(log, flush=True)
+            if torch.cuda.is_available():
                 try:
-                    peak_mem_gb = (torch.cuda.max_memory_allocated() / (1024 ** 3)) if torch.cuda.is_available() else 0.0
+                    torch.cuda.reset_peak_memory_stats()
                 except Exception:
-                    peak_mem_gb = 0.0
-                try:
-                    loss_value = round(float(loss.item()), 6) if loss is not None else None
-                except Exception:
-                    loss_value = None
-                log = {
-                    "step": step,
-                    "loss": loss_value,
-                    "tokens": int(tokens),
-                    "tokens_per_s": round(float(tps), 2),
-                    "step_time_ms": int(dt * 1000),
-                    "peak_mem_gb": round(float(peak_mem_gb), 2),
-                    "dataloader_idle_pct": None,
-                    "pack": False,
-                    "seq_len": args.seq_len,
-                }
-                print(log, flush=True)
-                if torch.cuda.is_available():
-                    try:
-                        torch.cuda.reset_peak_memory_stats()
-                    except Exception:
-                        pass
+                    pass
+    if prof is not None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        ev = prof.key_averages()  # 只统计 active 窗口
+
+        def _cuda_us(e):
+            # 兼容 CUDA/ROCm 和不同版本字段
+            for attr in ("self_cuda_time_total", "cuda_time_total", "self_cuda_time", "device_time"):
+                v = getattr(e, attr, 0.0)
+                if v and float(v) > 0:
+                    return float(v)
+            return 0.0
+
+        def _lname(s): return (s or "").lower()
+
+        # 扩展通信关键字（NCCL/RCCL + c10d）
+        def _is_comm_key(name: str) -> bool:
+            n = _lname(name)
+            return (
+                "nccl" in n or "rccl" in n
+                or "all_reduce" in n or "allreduce" in n
+                or "reduce_scatter" in n or "all_gather" in n or "_all_gather_base" in n
+                or "broadcast" in n
+                or n.startswith("c10d::allreduce_") or n.startswith("c10d::all_gather")
+                or n.startswith("c10d::reduce_scatter") or n.startswith("c10d::broadcast_")
+            )
+
+        # 扩展内存搬运关键字（ROCm 的 hip* 也算）
+        def _is_mem_key(name: str) -> bool:
+            n = _lname(name)
+            return (
+                "memcpy" in n or "memset" in n
+                or "hipmemcpy" in n or "hipmemset" in n
+                or "memcpyasync" in n or "hipmemcpyasync" in n or "hipmemsetasync" in n
+            )
+
+        # 避免把 ProfilerStep* 算进总 CUDA 时间
+        filtered = [e for e in ev if not _lname(e.key).startswith("profilerstep")]
+        cuda_us   = sum(_cuda_us(e) for e in filtered)
+        comm_us   = sum(_cuda_us(e) for e in filtered if _is_comm_key(e.key))
+        memcpy_us = sum(_cuda_us(e) for e in filtered if _is_mem_key(e.key))
+        comp_us = max(0.0, cuda_us - comm_us - memcpy_us)
+
+        # 粗略的“掩盖比例”估计：overlap_ms = max(0, comp+comm - step_wall)
+        # 如果 overlap≈comm，则通信几乎被完全掩盖
+        step_wall_ms = prof_wall_ms
+        sum_ms = (comp_us + comm_us) / 1000.0
+        overlap_ms = max(0.0, sum_ms - step_wall_ms)
+        hidden_ratio = 0.0 if comm_us == 0 else min(1.0, overlap_ms / (comm_us / 1000.0))
+        # if rank == 0:
+        #     import pdb; pdb.set_trace()
+        out = {
+            "rank": rank,
+            "profiled_steps": prof_steps_done,
+            "T_comp_ms": round(comp_us/1000.0, 2),
+            "T_comm_ms": round(comm_us/1000.0, 2),
+            "T_mem_ms": round(memcpy_us/1000.0, 2),
+            "wall_ms": round(step_wall_ms, 2),
+            "est_hidden_comm_ratio": round(hidden_ratio, 3)
+        }
+        print({"profiling": out}, flush=True)
+        torch.distributed.barrier()
+
+        if args.profile_trace_dir:
+            os.makedirs(args.profile_trace_dir, exist_ok=True)
+            prof.export_chrome_trace(os.path.join(args.profile_trace_dir, f"trace_rank{rank}.json"))
+
+        prof.__exit__(None, None, None)
+
+def cleanup_dist():
+    if dist.is_initialized():
+        try:
+            dist.barrier()
+        except Exception:
+            pass
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
-    main()
+    try:
+        main()
+    finally:
+        cleanup_dist()
 
