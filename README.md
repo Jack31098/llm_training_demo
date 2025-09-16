@@ -1,6 +1,6 @@
 ## Key Results
-Node:AMD EPYC 7003 (PCIe) GPUs: 2× MI100 (gfx908) OS/Drivers: UBUNTU24.04 lts/ROCm 6.4
-Benchmarked with Qwen3 0.6B, seq_len=1024, over 32 steps, the readings are avg
+#### Node:AMD EPYC 7003 (PCIe) GPUs: 2× MI100 (gfx908) OS/Drivers: UBUNTU24.04 lts/ROCm 6.4
+#### Benchmarked with Qwen3 0.6B, seq_len=1024, over 32 steps, the readings are avg
 
 #### Legend: 
 `step_ms` avg over 32 steps (excl. data); 
