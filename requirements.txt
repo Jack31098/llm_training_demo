@@ -1,5 +1,5 @@
 torch==2.8.0
 transformers>=4.42.0
-deepspeed>=0.14.0
+deepspeed>=0.17.0
 
 
