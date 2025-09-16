@@ -1,4 +1,4 @@
-### Key Results (Benchmarked with Qwen3 0.6B, seq_len=1024, over 32 steps, the readings are avg)
+## Key Results (Benchmarked with Qwen3 0.6B, seq_len=1024, over 32 steps, the readings are avg)
 
 Legend: 
 `step_ms` avg over 32 steps (excl. data); 
@@ -18,14 +18,14 @@ Legend:
 | 8 | 8 | T | BF16 | 10418 | 1094 | 6303 | 20.16 |
 | 8 | 8 | T | FP32 | 14264 | 1618 | 5065 | 28.35 |
 
-### Key observations
+# Key observations
 PP: DeepSpeed 2-way pipeline with 1F1B (no ZeRO-2/3 in this config).
-Observation 1. On this setup, DS PP > native FSDP in throughput at GA≥8, while memory grows due to FP32 master weights.
-Observation 2. DS PP + ZeRO-2/3 was not used here due to incompatibilities with deepspeed version 0.17.1; results may differ on other versions.
-Observation 3. DS PP keeps FP32 master weights with FP16 optimizer, which increases memory footprint per layer.
+### Observation 1. On this setup, DS PP > native FSDP in throughput at GA≥8, while memory grows due to FP32 master weights.
+### Observation 2. DS PP + ZeRO-2/3 was not used here due to incompatibilities with deepspeed version 0.17.1; results may differ on other versions.
+### Observation 3. DS PP keeps FP32 master weights with FP16 optimizer, which increases memory footprint per layer.
 
 
-### Known limitations (this repo, this setup)
+## Known limitations (this repo, this setup)
 
 SDPA (memory-efficient) on ROCm/gfx908: no GQA support in PyTorch 2.8 ROCm; emulation via tiling K/V negates gains.
 
@@ -35,7 +35,7 @@ Fallback: use SDPA math or eager attention where above constraints apply.
 We will enable masked FA and GQA-aware MEA once upstream supports them on ROCm gfx908.
 
 
-### Goal
+## Goal
 
 Demonstrate supervised fine-tuning (SFT) of a Qwen3 base 0.6B decoder using FSDP and 2-way Pipeline Parallel (PP) on an AMD EPYC 7403 + 2× MI100 (gfx908) node.
 We will:
@@ -49,7 +49,7 @@ and compare throughput under different gradient accumulation (GA) settings that 
 
 
 
-### Definitions
+## Definitions
 
 N: world size (number of GPUs). Here N = 2.
 B_micro: per-device micro-batch size (tokens are counted separately).
@@ -60,7 +60,7 @@ Effective tokens per step: T_eff = S × B_global.
 Example that hits ~100k: S=1024, B_micro=1, GA=50, N=2 → T_eff = 1024 × 1 × 50 × 2 = 102,400.
 
 
-### Hardware & Software
+## Hardware & Software
 Node: AMD EPYC 7003 (PCIe)
 GPUs: 2× MI100 (gfx908)
 OS/Drivers: UBUNTU24.04 lts/ROCm 6.4
@@ -71,32 +71,32 @@ Optional: SDPA’s FlashAttention backend on ROCm/gfx908 (feature-gated)
 Tokenizer/Models: Qwen3-base 0.6B decoder (HF style)
 
 
-### Setup
+## Setup
 
 - Create and activate a Python 3.12 environment.
 - Install ROCm PyTorch 2.8 per official instructions (ROCm wheels).
 - Install project deps:
 
 pip install -r llm_demo/requirements.txt
-# or as a package (adds console script llm-demo-fsdp)
+#### or as a package (adds console script llm-demo-fsdp)
 pip install -e llm_demo
 
 
-Data & models
+#### Data & models
 
 - Place a HF-compatible Qwen3 model under llm_demo/models/ (or use a path).
 - Training data JSONL example provided at llm_demo/data/sft_en.jsonl.
 
 
-Run: FSDP 
+#### Run: FSDP 
 
-# Uses the console script wrapper to mirror env from fsdp/launch_script.py
+Uses the console script wrapper to mirror env from fsdp/launch_script.py
 bash fsdp/launch_fsdp.sh
 
 This calls train_fsdp.py with defaults set in the launcher (edit as needed).
 
 
-Run: 2-way pipeline parallel (DeepSpeed, 2 GPUs)
+#### Run: 2-way pipeline parallel (DeepSpeed, 2 GPUs)
 
 bash pp/launch_pp.sh
 
