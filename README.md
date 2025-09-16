@@ -1,6 +1,8 @@
-## Key Results (Benchmarked with Qwen3 0.6B, seq_len=1024, over 32 steps, the readings are avg)
+## Key Results
+Node:AMD EPYC 7003 (PCIe) GPUs: 2× MI100 (gfx908) OS/Drivers: UBUNTU24.04 lts/ROCm 6.4
+Benchmarked with Qwen3 0.6B, seq_len=1024, over 32 steps, the readings are avg
 
-Legend: 
+#### Legend: 
 `step_ms` avg over 32 steps (excl. data); 
 `comm_ms` RCCL avg via `custom profiler`;  
 `toks/s` global tokens/s (all GPUs); 
