@@ -20,9 +20,9 @@ Legend:
 
 # Key observations
 PP: DeepSpeed 2-way pipeline with 1F1B (no ZeRO-2/3 in this config).
-### Observation 1. On this setup, DS PP > native FSDP in throughput at GA≥8, while memory grows due to FP32 master weights.
-### Observation 2. DS PP + ZeRO-2/3 was not used here due to incompatibilities with deepspeed version 0.17.1; results may differ on other versions.
-### Observation 3. DS PP keeps FP32 master weights with FP16 optimizer, which increases memory footprint per layer.
+#### Observation 1. On this setup, DS PP > native FSDP in throughput at GA≥8, while memory grows due to FP32 master weights.
+#### Observation 2. DS PP + ZeRO-2/3 was not used here due to incompatibilities with deepspeed version 0.17.1; results may differ on other versions.
+#### Observation 3. DS PP keeps FP32 master weights with FP16 optimizer, which increases memory footprint per layer.
 
 
 ## Known limitations (this repo, this setup)
