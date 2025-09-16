@@ -326,7 +326,7 @@ def main():
     parser.add_argument("--max_examples", type=int, default=1024,
                         help="stop after this many examples")
     parser.add_argument("--log_every", type=int, default=20)
-    parser.add_argument("--profile_steps", type=int, default=64,
+    parser.add_argument("--profile_steps", type=int, default=128,
                         help="when >0, sample to calculate T_comp/T_comm")
     parser.add_argument("--profile_trace_dir", type=str, default="",
                         help="optional: write Chrome trace to directory for visualization")
@@ -451,7 +451,7 @@ def main():
 
         def _cuda_us(e):
             # 兼容 CUDA/ROCm 和不同版本字段
-            for attr in ("self_cuda_time_total", "cuda_time_total", "self_cuda_time", "device_time"):
+            for attr in ("self_cuda_time_total", "cuda_time_total", "self_cuda_time", "cuda_time"):
                 v = getattr(e, attr, 0.0)
                 if v and float(v) > 0:
                     return float(v)
@@ -493,14 +493,14 @@ def main():
         sum_ms = (comp_us + comm_us) / 1000.0
         overlap_ms = max(0.0, sum_ms - step_wall_ms)
         hidden_ratio = 0.0 if comm_us == 0 else min(1.0, overlap_ms / (comm_us / 1000.0))
-        # if rank == 0:
-        #     import pdb; pdb.set_trace()
+        if rank == 0:
+            import pdb; pdb.set_trace()
         out = {
             "rank": rank,
             "profiled_steps": prof_steps_done,
-            "T_comp_ms": round(comp_us/1000.0, 2),
-            "T_comm_ms": round(comm_us/1000.0, 2),
-            "T_mem_ms": round(memcpy_us/1000.0, 2),
+            "T_comp_us": round(comp_us, 2),
+            "T_comm_us": round(comm_us, 2),
+            "T_mem_us": round(memcpy_us, 2),
             "wall_ms": round(step_wall_ms, 2),
             "est_hidden_comm_ratio": round(hidden_ratio, 3)
         }
