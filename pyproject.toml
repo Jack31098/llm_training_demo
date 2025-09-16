@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm_demo"
+version = "0.1.0"
+description = "SFT training demo with FSDP and 2-way Pipeline Parallel on ROCm"
+authors = [{ name = "Jack" }]
+requires-python = ">=3.12"
+readme = "README.md"
+license = { text = "MIT" }
+keywords = ["LLM", "FSDP", "DeepSpeed", "Pipeline Parallel", "ROCm"]
+
+dependencies = [
+  "torch==2.8.0",
+  "transformers>=4.42.0",
+  "deepspeed>=0.14.0",
+]
+
+[project.scripts]
+llm-demo-fsdp = "llm_demo.fsdp.launch_script:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["llm_demo*"]
+exclude = ["tests*"]
