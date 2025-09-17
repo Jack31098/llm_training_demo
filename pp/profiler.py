@@ -16,7 +16,7 @@ class StepTiming:
 
 
 def should_enable_timer(step_index_1based: int, start_step: int, timer_steps: int) -> bool:
-    """是否在给定 step 开启计时窗口。start_step 跳过前 K 步，timer_steps=0 表示一直记。"""
+    """whether to enable timer on the given step. start_step skips the first K steps, timer_steps=0 means to record all steps."""
     if step_index_1based <= start_step:
         return False
     if timer_steps <= 0:
@@ -25,13 +25,13 @@ def should_enable_timer(step_index_1based: int, start_step: int, timer_steps: in
 
 
 class CommTimer:
-    """用 CUDA/HIP 事件给 collective 计时；步头步尾圈住 train_batch()。"""
+    """Use CUDA/HIP events to time collective operations; wrap train_batch() with step head and tail."""
 
-    # 这些函数名在 torch.distributed / deepspeed.comm / cdb.* 上都尽量包一下
+    # These function names are wrapped in torch.distributed / deepspeed.comm / cdb.*
     TARGET_FUNCS = [
         "all_reduce", "all_gather_into_tensor", "reduce_scatter_tensor",
         "broadcast", "all_to_all_single", "send", "recv",
-        # 兼容旧名/别名
+        # compatible with old names/aliases
         "all_gather", "reduce_scatter", "isend", "irecv", "barrier",
     ]
 
@@ -41,14 +41,14 @@ class CommTimer:
         self._pairs: List[Tuple[torch.cuda.Event, torch.cuda.Event]] = []
         self._step_evt_start: Optional[torch.cuda.Event] = None
 
-    # ---------- 公共 API ----------
+    # ---------- Public API ----------
 
     def install(self) -> None:
-        """安装钩子：可以在分布式 init 之前或之后调用。"""
+        """Install hooks: can be called before or after distributed init."""
         if not self.enable or self._installed:
             return
-        self._patch_all_namespaces()   # 先把能补的都补上
-        self._attach_lazy_hooks()      # 拦截 DS 的 init_distributed/set_backend，等 cdb 建好再补一遍
+        self._patch_all_namespaces()   # patch all namespaces first
+        self._attach_lazy_hooks()      # intercept DS's init_distributed/set_backend, patch again after cdb is ready
         self._installed = True
 
     def begin_step(self) -> None:
@@ -63,15 +63,15 @@ class CommTimer:
         if not self.enable or self._step_evt_start is None:
             return None
 
-        # 记录步尾
+        # record step end
         step_end = torch.cuda.Event(enable_timing=True)
         step_end.record(torch.cuda.current_stream())
         torch.cuda.synchronize()
 
-        # 整步 GPU 时长
+        # record step duration
         step_ms = float(self._step_evt_start.elapsed_time(step_end))
 
-        # —— 把每个 collective 的起止事件，转换成相对步起点的 [t0, t1] 区间 —— 
+        # convert each collective's start and end events to [t0, t1] interval relative to step start
         intervals = []
         for s, e in self._pairs:
             try:
@@ -79,16 +79,16 @@ class CommTimer:
                 t1 = float(self._step_evt_start.elapsed_time(e))
                 if t1 < t0:
                     t0, t1 = t1, t0
-                # clamp 到 [0, step_ms]，并忽略极短/异常
+                # clamp to [0, step_ms], and ignore very short/abnormal intervals
                 t0 = max(0.0, min(t0, step_ms))
                 t1 = max(0.0, min(t1, step_ms))
                 if t1 - t0 > 1e-3:
                     intervals.append((t0, t1))
             except Exception:
-                # 个别事件测不出偏移就跳过
+                # skip events that cannot be measured
                 pass
 
-        # —— 合并区间（线段 union），得到通信覆盖时长 —— 
+        # merge intervals (line segment union), get communication coverage duration
         intervals.sort()
         comm_union = 0.0
         cur_s = cur_e = None
@@ -103,7 +103,7 @@ class CommTimer:
         if cur_s is not None:
             comm_union += (cur_e - cur_s)
 
-        # —— 兜底：如果一个都没并上，退回“求和再截断” —— 
+        # fallback: if none are merged, return "sum and truncate"
         if comm_union <= 0.0 and self._pairs:
             raw_sum = 0.0
             for s, e in self._pairs:
@@ -128,10 +128,10 @@ class CommTimer:
         except Exception:
             return 0
 
-    # ---------- 扁平化：下面全是内部小工具，互不嵌套 ----------
+    # ---------- Flatten: below are internal tools, no nesting ----------
 
     def _wrap_collective_fn(self, fn: Callable) -> Callable:
-        """模块函数/自由函数包装：调用前后在同一流打事件，不改函数签名，不同步。"""
+        """Module function/free function wrapper: record events on the same stream before and after calling, without changing the function signature, no synchronization."""
         def _inner(*args, **kwargs):
             if not self.enable or not torch.cuda.is_available():
                 return fn(*args, **kwargs)
@@ -151,7 +151,7 @@ class CommTimer:
         return _inner
 
     def _wrap_class_method(self, cls: type, name: str) -> None:
-        """类方法包装：对 cdb.__class__ 打补丁，避免实例绑定坑。"""
+        """Class method wrapper: patch cdb.__class__ to avoid instance binding issues."""
         if not hasattr(cls, name):
             return
         method = getattr(cls, name)
@@ -173,7 +173,7 @@ class CommTimer:
         setattr(cls, name, wrapped)
 
     def _wrap_module_space(self, space, names: List[str]) -> None:
-        """给某个命名空间（模块或对象）里的同名可调用成员打补丁。"""
+        """Patch callable members in a given namespace (module or object)."""
         if space is None:
             return
         for n in names:
@@ -184,7 +184,7 @@ class CommTimer:
                 setattr(space, n, self._wrap_collective_fn(fn))
 
     def _patch_all_namespaces(self) -> None:
-        """一次性对 torch.distributed 层、deepspeed.comm 层、已就绪的 cdb 进行补丁。"""
+        """Patch all torch.distributed, deepspeed.comm, and ready cdb."""
         # 1) torch.distributed 顶层与 distributed_c10d
         try:
             import torch.distributed as tdist
@@ -196,7 +196,7 @@ class CommTimer:
         except Exception:
             pass
 
-        # 2) deepspeed.comm 模块函数
+        # 2) deepspeed.comm module functions
         ds_comm = None
         try:
             import deepspeed
@@ -205,25 +205,25 @@ class CommTimer:
         except Exception:
             ds_comm = None
 
-        # 3) 如果 cdb 已就绪，再对其“类方法”打补丁（兜底）
+        # 3) if cdb is ready, patch its "class methods" (fallback)
         try:
             if ds_comm is not None and getattr(ds_comm, "cdb", None) is not None:
                 cdb = ds_comm.cdb
-                self._wrap_module_space(cdb, self.TARGET_FUNCS)  # 实例级兜底（多数实现无效，但无伤大雅）
+                self._wrap_module_space(cdb, self.TARGET_FUNCS)  # instance-level fallback (most implementations are无效，但无伤大雅）
                 for n in self.TARGET_FUNCS:
                     self._wrap_class_method(cdb.__class__, n)
         except Exception:
             pass
 
     def _attach_lazy_hooks(self) -> None:
-        """拦截 DS 的 init_distributed/set_backend，等 cdb 建好后再补一次。"""
+        """Intercept DS's init_distributed/set_backend, patch again after cdb is ready."""
         try:
             import deepspeed
             ds_comm = deepspeed.comm
         except Exception:
             return
 
-        # 包一层：原函数返回后，再跑 _patch_all_namespaces
+        # wrap one layer: run _patch_all_namespaces after the original function returns
         def _wrap_after(name: str):
             if not hasattr(ds_comm, name):
                 return
