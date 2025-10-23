@@ -230,6 +230,8 @@ def train(args):
         wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=int(args.fsdp_wrap_min_params))
         # Set FSDP mixed precision to match chosen dtype
         # if dtype == torch.bfloat16:
+        #     print("set mp_policy to reduce/buffer type bfloat16")
+        #     # This makes the kernel computing in fp32, higher transient memory usage
         #     mp_policy = MixedPrecision(param_dtype=torch.float32, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16)
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
