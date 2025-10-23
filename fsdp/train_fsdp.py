@@ -13,6 +13,7 @@ import math
 import os
 import random
 import time
+from torch.utils.checkpoint import checkpoint
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -198,7 +199,7 @@ def train(args):
         os.makedirs(args.output_dir, exist_ok=True)
         (Path(args.output_dir) / "metrics").mkdir(parents=True, exist_ok=True)
 
-    tok = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
+    tok = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True, local_files_only=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
@@ -206,16 +207,22 @@ def train(args):
     # Choose dtype from flags (default FP32; enable BF16/FP16 only when flag is provided)
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
     print("passin dtype", dtype)
+    # Strictly local load + correct kwarg name
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         dtype=dtype,
+        device_map=None,
+        local_files_only=True,
     )
-    model_gradient_ckpt_supported = hasattr(model, "gradient_checkpointing_enable")
-    if args.use_activation_checkpointing and model_gradient_ckpt_supported:
-        model.gradient_checkpointing_enable()
+    # Disable KV cache BEFORE enabling checkpointing
     model.config.use_cache = False
+    # if args.use_activation_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+    #     # (HF GC is fine once FSDP uses_orig_params; for perfect FSDP-compat, use checkpoint_wrapper – see note below)
+    #     model.gradient_checkpointing_enable()
     # model.config.attn_implementation = "eager"
     mp_policy = None
+    if args.use_activation_checkpointing:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     # FSDP config (optional)
     use_fsdp = dist.get_world_size() > 1
@@ -223,10 +230,20 @@ def train(args):
         wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=int(args.fsdp_wrap_min_params))
         # Set FSDP mixed precision to match chosen dtype
         # if dtype == torch.bfloat16:
+        #     print("set mp_policy to reduce/buffer type bfloat16")
+        #     # This makes the kernel computing in fp32, higher transient memory usage
         #     mp_policy = MixedPrecision(param_dtype=torch.float32, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16)
-        # For FP16, disable mixed precision to avoid conflicts with ShardedGradScaler
+
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        model = FSDP(model, auto_wrap_policy=wrap_policy, mixed_precision=mp_policy, device_id=local_rank)
+        # Crucial for checkpointing correctness on sharded params:
+        model = FSDP(
+            model,
+            auto_wrap_policy=wrap_policy,
+            mixed_precision=mp_policy,
+            device_id=local_rank,
+            use_orig_params=True,
+            sync_module_states=True,   # safe: materializes consistent params on all ranks
+        )
     else:
         model = model.to(device)
 
